@@ -1,0 +1,19 @@
+{
+  "name": "portal",
+  "version": "0.1.0",
+  "description": "Bun-powered file upload/download portal with drilldown UI",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --hot run src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1"
+  },
+  "devDependencies": {
+    "@types/archiver": "^6.0.2",
+    "@types/bun": "^1.1.10",
+    "typescript": "^5.5.4"
+  }
+}

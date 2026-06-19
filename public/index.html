@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Portal</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">▣</span>
+        <span class="brand-name">Portal</span>
+      </div>
+
+      <nav class="crumbs" id="crumbs" aria-label="Folder breadcrumbs"></nav>
+
+      <div class="topbar-right">
+        <div class="search">
+          <input
+            id="filter"
+            type="search"
+            placeholder="Filter this folder…"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </div>
+        <div class="status" id="status" title="Server connection">
+          <span class="dot" id="status-dot"></span>
+          <span class="status-text" id="status-text">connecting…</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="toolbar">
+      <div class="toolbar-left">
+        <button id="btn-up" class="btn ghost" title="Go up one folder">↑ Up</button>
+        <button id="btn-refresh" class="btn ghost" title="Refresh listing">↻ Refresh</button>
+        <button id="btn-newfolder" class="btn ghost">+ New folder</button>
+        <label class="btn ghost upload-label">
+          ⬆ Upload
+          <input id="file-input" type="file" multiple hidden />
+        </label>
+      </div>
+
+      <div class="toolbar-right">
+        <span id="selection-summary" class="muted">No items selected</span>
+        <button id="btn-download" class="btn primary" disabled>Download</button>
+      </div>
+    </section>
+
+    <main class="listing" id="listing">
+      <div class="list-header">
+        <label class="cell cell-check">
+          <input type="checkbox" id="select-all" />
+        </label>
+        <div class="cell cell-name">Name</div>
+        <div class="cell cell-size">Size</div>
+        <div class="cell cell-mtime">Modified</div>
+      </div>
+      <div class="viewport" id="viewport">
+        <div class="spacer" id="spacer"></div>
+        <div class="rows" id="rows"></div>
+      </div>
+      <div class="empty" id="empty" hidden>This folder is empty.</div>
+    </main>
+
+    <aside class="uploads" id="uploads" hidden>
+      <header class="uploads-header">
+        <span>Uploads</span>
+        <button id="uploads-clear" class="btn tiny ghost">Clear done</button>
+      </header>
+      <ul id="uploads-list"></ul>
+    </aside>
+
+    <div
+      class="dropzone"
+      id="dropzone"
+      hidden
+      aria-hidden="true"
+    >
+      <div class="dropzone-inner">
+        Drop files to upload to <strong id="dropzone-path">/</strong>
+      </div>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
