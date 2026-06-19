@@ -18,6 +18,11 @@
 
 * { box-sizing: border-box; }
 
+/* The HTML `hidden` attribute defaults to `display: none` via the UA
+   stylesheet, but author styles like `display: flex` on .dropzone/.uploads
+   override that. This rule restores the expected behaviour. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;

@@ -1,0 +1,30 @@
+services:
+  portal:
+    # --- Path A: build from source on this host (default). ---
+    build: .
+
+    # --- Path B: use a pre-built image (skip cloning + building). ---
+    # Comment out the `build:` line above and uncomment one of these:
+    # image: ghcr.io/your-org/portal:latest
+    image: portal:latest
+
+    container_name: portal
+    restart: unless-stopped
+
+    # Bind to loopback so the container is only reachable from the host
+    # (i.e. only nginx-on-host can talk to it). Drop the `127.0.0.1:` prefix
+    # if you want the container reachable directly from the network.
+    ports:
+      - "127.0.0.1:4000:4000"
+
+    volumes:
+      # Host folder served by the portal. Anything dropped here is visible
+      # in the UI; uploads land here.
+      - ./data:/data
+
+    environment:
+      # Override config.json values without rebuilding.
+      PORTAL_MAX_UPLOAD_BYTES: "5368709120"  # 5 GB
+      # PORTAL_PORT: "4000"
+      # PORTAL_HOST: "0.0.0.0"
+

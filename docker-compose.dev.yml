@@ -1,0 +1,15 @@
+# Dev-mode overrides for docker compose. Merged on top of docker-compose.yml
+# when used with `-f docker-compose.yml -f docker-compose.dev.yml` (the
+# `docker:watch` npm script does this for you).
+#
+# It bind-mounts the source folders so edits on the host are instantly
+# visible inside the container, and swaps the command to `bun --hot` so the
+# server reloads when src/server.ts (or anything it imports) changes.
+
+services:
+  portal:
+    command: ["bun", "--hot", "run", "src/server.ts"]
+    volumes:
+      - ./src:/app/src:ro
+      - ./public:/app/public:ro
+      - ./config.json:/app/config.json:ro

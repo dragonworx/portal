@@ -99,15 +99,37 @@ response buffering** so streamed zips flush as they're built.
 
 ### 1. Bind Bun to loopback
 
+**Why:** with `host: "0.0.0.0"` Bun listens on every interface, which means
+clients could bypass nginx entirely by hitting `http://<server>:4000` and
+skip TLS, auth, rate limits, and access logs. Binding to `127.0.0.1` makes
+the Bun process reachable only from the same host, so nginx becomes the only
+door in. Open the public ports (80/443) on the server firewall and *close*
+4000 from the outside.
+
 Edit `config.json`:
 
 ```json
 { "host": "127.0.0.1", "port": 4000, "root": "./files", "maxUploadBytes": 5368709120 }
 ```
 
-This ensures only nginx can reach the Bun process.
-
 ### 2. nginx server block
+
+**Why:** nginx's defaults are tuned for small, request/response web apps and
+actively harm Portal. `client_max_body_size` defaults to **1 MB**, so any
+upload bigger than that gets rejected with `413` before Bun ever sees it.
+`proxy_request_buffering` defaults to **on**, which means nginx accepts the
+entire upload to a temp file on its own disk *before* forwarding a single
+byte to Bun — the client's progress bar finishes long before the file is
+really saved, disk usage spikes, and the upload appears to hang at 100 %.
+`proxy_buffering` defaults to **on** for responses, which forces nginx to
+accumulate the streamed `/api/zip` archive before sending it to the browser,
+turning a constant-memory stream into a giant buffer. Default timeouts
+(60 s) also kill any multi-GB transfer mid-flight.
+
+The block below fixes those for the streaming routes only, keeps default
+buffering for the small JSON/static routes (where it helps), and adds the
+usual HTTPS termination, `X-Forwarded-*` headers, and an optional
+`auth_basic` since Portal has no auth of its own.
 
 ```nginx
 upstream portal_app {
@@ -177,6 +199,14 @@ sudo nginx -t && sudo systemctl reload nginx
 ```
 
 ### 3. Keep Bun running (systemd)
+
+**Why:** the nginx block assumes something is always listening on
+`127.0.0.1:4000`. If you start Bun by hand in a shell, the first server
+reboot — or the first time the process crashes — leaves nginx returning
+`502 Bad Gateway` until someone SSHes in and restarts it. A systemd unit
+starts Bun at boot, restarts it on failure, runs it as an unprivileged user
+so a bug can't read the rest of the disk, and confines writes to the
+configured root folder via `ProtectSystem=strict` + `ReadWritePaths`.
 
 `/etc/systemd/system/portal.service`:
 

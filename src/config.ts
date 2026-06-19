@@ -9,24 +9,27 @@ export interface AppConfig {
 }
 
 export function loadConfig(configPath: string): AppConfig {
-  const file = Bun.file(configPath);
-  if (!file.size) {
-    throw new Error(`Config file not found: ${configPath}`);
+  // The config file is optional when every value is supplied via env vars
+  // (the usual case in container deployments).
+  let raw: Record<string, unknown> = {};
+  if (existsSync(configPath)) {
+    raw = JSON.parse(require("node:fs").readFileSync(configPath, "utf8"));
   }
-  const raw = JSON.parse(require("node:fs").readFileSync(configPath, "utf8"));
-  const root = isAbsolute(raw.root)
-    ? raw.root
-    : resolve(process.cwd(), raw.root);
+
+  const rootRaw = (process.env.PORTAL_ROOT ?? (raw.root as string) ?? "./files");
+  const root = isAbsolute(rootRaw) ? rootRaw : resolve(process.cwd(), rootRaw);
   if (!existsSync(root)) {
     mkdirSync(root, { recursive: true });
   }
   const realRoot = realpathSync(root);
-  return {
-    root: realRoot,
-    port: raw.port ?? 4000,
-    host: raw.host ?? "0.0.0.0",
-    maxUploadBytes: raw.maxUploadBytes ?? 5 * 1024 * 1024 * 1024,
-  };
+
+  const port = Number(process.env.PORTAL_PORT ?? raw.port ?? 4000);
+  const host = String(process.env.PORTAL_HOST ?? raw.host ?? "0.0.0.0");
+  const maxUploadBytes = Number(
+    process.env.PORTAL_MAX_UPLOAD_BYTES ?? raw.maxUploadBytes ?? 5 * 1024 * 1024 * 1024,
+  );
+
+  return { root: realRoot, port, host, maxUploadBytes };
 }
 
 /**
