@@ -52,6 +52,87 @@ you must:
 > download, and upload to the configured root. Either keep it on a trusted
 > network or front it with auth (see *Deploying behind nginx* below).
 
+## Run with Docker
+
+Two ways to get Portal running on a server with Docker. Both use the same
+`docker-compose.yml` — the only difference is whether the image is pulled
+from a registry or built locally.
+
+### Option 1 — Pull a pre-built image (recommended)
+
+> **Note:** Portal does not currently publish an official image. Replace
+> `ghcr.io/OWNER/portal:latest` below with whatever you publish via
+> `bun run docker:publish` (see *Publishing your own image* further down).
+
+You only need `docker-compose.yml` and a place for your files. No clone,
+no Bun, no Node:
+
+```sh
+mkdir portal && cd portal
+curl -O https://raw.githubusercontent.com/OWNER/portal/main/docker-compose.yml
+mkdir data
+
+# Edit docker-compose.yml: remove the `build: .` line and uncomment the
+# `image: ghcr.io/OWNER/portal:latest` line (pointing at your registry).
+
+docker compose up -d
+```
+
+Portal is now on <http://127.0.0.1:4000> (the default `ports:` binding is
+loopback-only — drop the `127.0.0.1:` prefix in `docker-compose.yml` to
+expose it on the network). Drop files into `./data` and they appear in the
+UI; uploads land in the same folder.
+
+Upgrade by pulling the new tag and recreating the container:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+### Option 2 — Clone and build from source
+
+Use this if you want to track your own fork, modify the code, or run a
+version that isn't published.
+
+```sh
+git clone https://github.com/OWNER/portal.git
+cd portal
+
+# The Dockerfile copies a pre-installed node_modules into the image (see the
+# comment at the top of the Dockerfile for why). Run the install once on the
+# host before building:
+npm install --omit=dev --no-audit --no-fund
+
+bun run docker:build   # docker compose build
+bun run docker:up      # docker compose up -d, then tails logs
+```
+
+Rebuild after pulling new commits:
+
+```sh
+git pull
+npm install --omit=dev --no-audit --no-fund
+bun run docker:build
+bun run docker:up
+```
+
+For working on Portal itself, `bun run docker:watch` brings the container up
+with the source folders bind-mounted and `bun --hot` watching for changes.
+
+### Publishing your own image
+
+`bun run docker:publish` installs production deps, builds the image, and
+pushes it to a registry. Override the tag with env vars:
+
+```sh
+# Defaults to ghcr.io/OWNER/portal:latest — change OWNER (and the defaults
+# in package.json) once you've decided on a real registry path.
+PORTAL_IMAGE=ghcr.io/your-org/portal PORTAL_TAG=1.2.3 bun run docker:publish
+```
+
+You'll need to `docker login` to the target registry first.
+
 ## Features
 
 - **Drilldown navigation** with breadcrumb path; URL hash reflects the
