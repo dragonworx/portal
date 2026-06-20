@@ -23,7 +23,7 @@ export function loadConfig(configPath: string): FullConfig {
     raw = JSON.parse(readFileSync(configPath, "utf8"));
   }
 
-  const rootRaw = (process.env.PORTAL_ROOT ?? (raw.root as string) ?? "./files");
+  const rootRaw = (process.env.PORTAL_ROOT ?? (raw.root as string) ?? "./data");
   const root = isAbsolute(rootRaw) ? rootRaw : resolve(process.cwd(), rootRaw);
   if (!existsSync(root)) {
     mkdirSync(root, { recursive: true });

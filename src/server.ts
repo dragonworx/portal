@@ -1,4 +1,4 @@
-import { stat, readdir, mkdir, rm, rename } from "node:fs/promises";
+import { stat, readdir, mkdir, rm, rename, cp } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { Readable } from "node:stream";
 import { basename, dirname, join } from "node:path";
@@ -451,6 +451,177 @@ async function handleRename(req: Request): Promise<Response> {
   return json({ ok: true, name: newName });
 }
 
+/** Defensive cap on the number of entries a single move/copy can ask for. */
+const MAX_TRANSFER_PATHS = 10_000;
+
+type ConflictPolicy = "fail" | "overwrite" | "skip";
+
+/**
+ * Shared core for /api/move and /api/copy. Validates a batch of source paths
+ * against a target directory, surfaces conflicts up-front when the caller
+ * opts in, and reports per-entry results so the client can show partial
+ * outcomes precisely.
+ */
+async function handleTransfer(
+  req: Request,
+  mode: "move" | "copy",
+): Promise<Response> {
+  const body = (await readJsonLimited(req, JSON_BODY_LIMIT)) as {
+    from?: unknown;
+    to?: unknown;
+    onConflict?: unknown;
+  };
+  if (!Array.isArray(body.from) || body.from.length === 0) {
+    return json({ error: "from required" }, { status: 400 });
+  }
+  if (body.from.length > MAX_TRANSFER_PATHS) {
+    return json({ error: "too many entries" }, { status: 400 });
+  }
+  if (typeof body.to !== "string") {
+    return json({ error: "to required" }, { status: 400 });
+  }
+  const onConflict: ConflictPolicy =
+    body.onConflict === "overwrite"
+      ? "overwrite"
+      : body.onConflict === "skip"
+        ? "skip"
+        : "fail";
+
+  const toAbs = safeResolve(config.root, body.to, true);
+  const toStat = await stat(toAbs);
+  if (!toStat.isDirectory()) {
+    return json({ error: "destination is not a directory" }, { status: 400 });
+  }
+
+  // Resolve and validate every source path first so we either accept the
+  // whole batch or reject it; no partial side-effects from validation errors.
+  interface Plan {
+    src: string;
+    dest: string;
+    name: string;
+    noop: boolean;
+  }
+  const plans: Plan[] = [];
+  for (const raw of body.from) {
+    if (typeof raw !== "string") {
+      return json({ error: "invalid source" }, { status: 400 });
+    }
+    const src = safeResolve(config.root, raw, true);
+    if (src === config.root) {
+      return json({ error: `cannot ${mode} root` }, { status: 400 });
+    }
+    const name = basename(src);
+    const dest = join(toAbs, name);
+    // basename has no separators so dest cannot escape toAbs, but double-check.
+    if (dest !== config.root && !dest.startsWith(config.root + "/")) {
+      return json({ error: "invalid destination" }, { status: 400 });
+    }
+    // Refuse to put a folder into itself or any of its descendants.
+    if (toAbs === src || toAbs.startsWith(src + "/")) {
+      return json(
+        { error: `cannot ${mode} "${name}" into itself` },
+        { status: 400 },
+      );
+    }
+    plans.push({ src, dest, name, noop: src === dest });
+  }
+
+  // Up-front conflict probe — lets the client show a single Overwrite/Skip
+  // dialog instead of dribbling one error per file.
+  if (onConflict === "fail") {
+    const conflicts: string[] = [];
+    for (const p of plans) {
+      if (p.noop) continue;
+      try {
+        await stat(p.dest);
+        conflicts.push(p.name);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+    }
+    if (conflicts.length > 0) {
+      return json({ error: "conflict", conflicts }, { status: 409 });
+    }
+  }
+
+  interface ResultEntry {
+    name: string;
+    status: "moved" | "copied" | "skipped" | "overwritten" | "error";
+    error?: string;
+  }
+  const results: ResultEntry[] = [];
+
+  for (const p of plans) {
+    if (p.noop) {
+      results.push({ name: p.name, status: "skipped" });
+      continue;
+    }
+    try {
+      let existed = false;
+      try {
+        await stat(p.dest);
+        existed = true;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+      if (existed) {
+        if (onConflict === "skip") {
+          results.push({ name: p.name, status: "skipped" });
+          continue;
+        }
+        if (onConflict === "overwrite") {
+          await rm(p.dest, { recursive: true, force: true });
+        }
+        // onConflict === 'fail' here would have short-circuited above, but a
+        // race could have created the file in the meantime. Treat it as a
+        // per-entry error rather than aborting the whole batch.
+        else {
+          results.push({
+            name: p.name,
+            status: "error",
+            error: "already exists",
+          });
+          continue;
+        }
+      }
+
+      if (mode === "move") {
+        try {
+          await rename(p.src, p.dest);
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code === "EXDEV") {
+            // Different filesystem — fall back to copy + delete.
+            await cp(p.src, p.dest, { recursive: true, errorOnExist: false });
+            await rm(p.src, { recursive: true, force: true });
+          } else if (code === "EACCES" || code === "EPERM") {
+            throw new PathError("Permission denied", 403);
+          } else {
+            throw e;
+          }
+        }
+        results.push({
+          name: p.name,
+          status: existed ? "overwritten" : "moved",
+        });
+      } else {
+        await cp(p.src, p.dest, { recursive: true, errorOnExist: false });
+        results.push({
+          name: p.name,
+          status: existed ? "overwritten" : "copied",
+        });
+      }
+    } catch (e) {
+      if (e instanceof PathError) throw e;
+      const msg = e instanceof Error ? e.message : "error";
+      results.push({ name: p.name, status: "error", error: msg });
+    }
+  }
+
+  const anyError = results.some((r) => r.status === "error");
+  return json({ ok: !anyError, results });
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Auth handlers                                                             */
 /* -------------------------------------------------------------------------- */
@@ -651,6 +822,12 @@ Bun.serve({
       }
       if (url.pathname === "/api/rename" && req.method === "POST") {
         return withSecurityHeaders(await handleRename(req));
+      }
+      if (url.pathname === "/api/move" && req.method === "POST") {
+        return withSecurityHeaders(await handleTransfer(req, "move"));
+      }
+      if (url.pathname === "/api/copy" && req.method === "POST") {
+        return withSecurityHeaders(await handleTransfer(req, "copy"));
       }
 
       // --- Static client ------------------------------------------------------

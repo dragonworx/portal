@@ -15,6 +15,15 @@ const els = {
   btnRefresh: document.getElementById("btn-refresh"),
   btnNewFolder: document.getElementById("btn-newfolder"),
   btnDownload: document.getElementById("btn-download"),
+  btnCut: document.getElementById("btn-cut"),
+  btnCopy: document.getElementById("btn-copy"),
+  btnPaste: document.getElementById("btn-paste"),
+  btnClipboardClear: document.getElementById("btn-clipboard-clear"),
+  clipboardChip: document.getElementById("clipboard-chip"),
+  chipIcon: document.getElementById("chip-icon"),
+  chipMode: document.getElementById("chip-mode"),
+  chipSummary: document.getElementById("chip-summary"),
+  chipFrom: document.getElementById("chip-from"),
   fileInput: document.getElementById("file-input"),
   selSummary: document.getElementById("selection-summary"),
   uploads: document.getElementById("uploads"),
@@ -39,6 +48,10 @@ const state = {
    *  entry name we're editing; `value` mirrors the live <input> contents so
    *  the virtualised list can recreate the row mid-edit without losing it. */
   /** @type {{name:string,value:string}|null} */ editing: null,
+  /** Pending move/copy. `sourcePath` is the folder the items were grabbed
+   *  from; `names` is a Set so we can dim source rows in the listing in O(1)
+   *  while still iterating in insertion order via a parallel array. */
+  /** @type {{mode:'move'|'copy',sourcePath:string,names:string[]}|null} */ clipboard: null,
 };
 
 /* -------------------------------------------------------------------------- */
@@ -176,6 +189,7 @@ async function loadPath(path) {
     renderCrumbs();
     renderList();
     renderSelection();
+    renderClipboard();
     setConnected(true);
     // Reflect current path in the URL hash for shareable links / back button.
     const target = "#/" + state.path.split("/").map(encodeURIComponent).join("/");
@@ -253,6 +267,16 @@ function buildRow(entry, index) {
   if (state.selected.has(entry.name)) row.classList.add("selected");
   const isEditing = state.editing && state.editing.name === entry.name;
   if (isEditing) row.classList.add("editing");
+  // Dim entries that are queued for a move from this exact folder so the
+  // user can see what's "in transit". (Copies don't dim — the originals stay.)
+  if (
+    state.clipboard &&
+    state.clipboard.mode === "move" &&
+    state.clipboard.sourcePath === state.path &&
+    state.clipboard.names.includes(entry.name)
+  ) {
+    row.classList.add("clipped");
+  }
 
   const check = document.createElement("label");
   check.className = "cell cell-check";
@@ -381,6 +405,8 @@ function syncSelectAllState(list) {
 function renderSelection() {
   const n = state.selected.size;
   els.btnDownload.disabled = n === 0;
+  els.btnCut.disabled = n === 0;
+  els.btnCopy.disabled = n === 0;
   if (n === 0) {
     els.selSummary.textContent = "No items selected";
   } else {
@@ -469,10 +495,168 @@ async function deleteEntry(entry) {
     state.entries = state.entries.filter((e) => e.name !== entry.name);
     state.selected.delete(entry.name);
     if (state.editing && state.editing.name === entry.name) state.editing = null;
+    // If this entry was queued for a move/copy, drop it from the clipboard.
+    if (state.clipboard) {
+      state.clipboard.names = state.clipboard.names.filter(
+        (n) =>
+          !(state.clipboard.sourcePath === state.path && n === entry.name),
+      );
+      if (state.clipboard.names.length === 0) state.clipboard = null;
+      renderClipboard();
+    }
     renderList();
     renderSelection();
   } catch (err) {
     alert(`Could not delete ${kind}: ${err.message}`);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Cut / copy / paste                                                        */
+/* -------------------------------------------------------------------------- */
+
+function setClipboard(mode) {
+  if (state.selected.size === 0) return;
+  // Snapshot the selection so subsequent navigation / re-selection doesn't
+  // mutate the pending operation.
+  state.clipboard = {
+    mode,
+    sourcePath: state.path,
+    names: Array.from(state.selected),
+  };
+  // For "cut" we keep the selection so the user can visually confirm what's
+  // queued; for "copy" we clear it — the originals are no longer "active".
+  if (mode === "copy") {
+    state.selected.clear();
+  }
+  renderClipboard();
+  renderVisible();
+  renderSelection();
+}
+
+function clearClipboard() {
+  if (!state.clipboard) return;
+  // Re-render any source rows we'd been dimming.
+  const wasOnSourcePath = state.clipboard.sourcePath === state.path;
+  state.clipboard = null;
+  renderClipboard();
+  if (wasOnSourcePath) renderVisible();
+}
+
+function renderClipboard() {
+  const cb = state.clipboard;
+  if (!cb) {
+    els.clipboardChip.hidden = true;
+    els.btnPaste.disabled = true;
+    return;
+  }
+  els.clipboardChip.hidden = false;
+  els.clipboardChip.classList.toggle("is-move", cb.mode === "move");
+  els.clipboardChip.classList.toggle("is-copy", cb.mode === "copy");
+  els.chipIcon.textContent = cb.mode === "move" ? "✂" : "❐";
+  els.chipMode.textContent = cb.mode === "move" ? "Move" : "Copy";
+  const n = cb.names.length;
+  els.chipSummary.textContent = `${n} item${n === 1 ? "" : "s"}`;
+  els.chipFrom.textContent = "/" + cb.sourcePath;
+  // Disable paste when the target is exactly the source folder of a move —
+  // it would be a no-op. (For copy we still allow it; the server reports
+  // each entry as a conflict and the user can confirm overwrite, but the
+  // common case is "no useful effect", so we disable that too.)
+  els.btnPaste.disabled = cb.sourcePath === state.path;
+  els.btnPaste.title =
+    cb.sourcePath === state.path
+      ? "Already in this folder"
+      : `Paste into /${state.path} (⌘/Ctrl+V)`;
+}
+
+async function pasteHere() {
+  const cb = state.clipboard;
+  if (!cb) return;
+  if (cb.sourcePath === state.path) return;
+  const from = cb.names.map((n) =>
+    cb.sourcePath ? `${cb.sourcePath}/${n}` : n,
+  );
+  const result = await runTransfer(cb.mode, from, state.path, "fail");
+  if (!result) return; // user cancelled
+  // On a successful move we consume the clipboard; for copy we keep it so
+  // the user can paste into multiple destinations (matches OS conventions).
+  if (cb.mode === "move") {
+    state.clipboard = null;
+    renderClipboard();
+  }
+  summariseTransferResult(cb.mode, result);
+  loadPath(state.path);
+}
+
+async function runTransfer(mode, from, to, onConflict) {
+  const csrf = getCsrfToken();
+  const headers = { "content-type": "application/json" };
+  if (csrf) headers["x-csrf-token"] = csrf;
+  let res;
+  try {
+    res = await fetch(`/api/${mode}`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers,
+      body: JSON.stringify({ from, to, onConflict }),
+    });
+  } catch (err) {
+    alert(`${mode === "move" ? "Move" : "Copy"} failed: ${err.message}`);
+    return null;
+  }
+  if (res.status === 401) {
+    redirectToLogin();
+    return null;
+  }
+  if (res.status === 409) {
+    // Server detected name collisions — let the user resolve them.
+    const body = await res.json().catch(() => ({}));
+    const choice = await askConflictResolution(body.conflicts || []);
+    if (!choice) return null;
+    return await runTransfer(mode, from, to, choice);
+  }
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body && body.error) msg = body.error;
+    } catch {
+      /* ignore */
+    }
+    alert(`${mode === "move" ? "Move" : "Copy"} failed: ${msg}`);
+    return null;
+  }
+  return await res.json();
+}
+
+function askConflictResolution(conflicts) {
+  const list = conflicts.slice(0, 8).join(", ");
+  const more = conflicts.length > 8 ? ` …and ${conflicts.length - 8} more` : "";
+  const msg =
+    `The destination already contains:\n  ${list}${more}\n\n` +
+    `Click OK to overwrite, Cancel to skip these and keep going. ` +
+    `(Choose Cancel on the next prompt to abort entirely.)`;
+  if (confirm(msg)) return Promise.resolve("overwrite");
+  if (confirm("Skip the conflicting items and transfer the rest?")) {
+    return Promise.resolve("skip");
+  }
+  return Promise.resolve(null);
+}
+
+function summariseTransferResult(mode, body) {
+  if (!body || !Array.isArray(body.results)) return;
+  const counts = { moved: 0, copied: 0, overwritten: 0, skipped: 0, error: 0 };
+  const errors = [];
+  for (const r of body.results) {
+    if (counts[r.status] !== undefined) counts[r.status]++;
+    if (r.status === "error") errors.push(`${r.name}: ${r.error || "failed"}`);
+  }
+  if (errors.length > 0) {
+    const verb = mode === "move" ? "moved" : "copied";
+    const ok = counts.moved + counts.copied + counts.overwritten;
+    alert(
+      `${ok} ${verb}, ${errors.length} failed:\n\n${errors.slice(0, 10).join("\n")}`,
+    );
   }
 }
 
@@ -676,6 +860,49 @@ els.btnUp.addEventListener("click", () => {
 els.btnRefresh.addEventListener("click", () => loadPath(state.path));
 
 els.btnDownload.addEventListener("click", downloadSelection);
+els.btnCut.addEventListener("click", () => setClipboard("move"));
+els.btnCopy.addEventListener("click", () => setClipboard("copy"));
+els.btnPaste.addEventListener("click", pasteHere);
+els.btnClipboardClear.addEventListener("click", clearClipboard);
+
+// Keyboard shortcuts. Ignored while focus is in a text input / textarea so we
+// don't intercept the user's typing in filter / rename inputs.
+window.addEventListener("keydown", (ev) => {
+  const t = ev.target;
+  const tag = t && t.tagName;
+  if (
+    tag === "INPUT" ||
+    tag === "TEXTAREA" ||
+    (t && t.isContentEditable)
+  ) {
+    if (ev.key === "Escape" && tag === "INPUT" && t.id === "filter") {
+      // let the filter handle its own Escape via blur; nothing to do here.
+    }
+    return;
+  }
+  const mod = ev.metaKey || ev.ctrlKey;
+  if (mod && (ev.key === "x" || ev.key === "X")) {
+    if (state.selected.size > 0) {
+      ev.preventDefault();
+      setClipboard("move");
+    }
+  } else if (mod && (ev.key === "c" || ev.key === "C")) {
+    if (state.selected.size > 0) {
+      ev.preventDefault();
+      setClipboard("copy");
+    }
+  } else if (mod && (ev.key === "v" || ev.key === "V")) {
+    if (state.clipboard && !els.btnPaste.disabled) {
+      ev.preventDefault();
+      pasteHere();
+    }
+  } else if (ev.key === "Escape") {
+    if (state.clipboard) {
+      ev.preventDefault();
+      clearClipboard();
+    }
+  }
+});
 
 els.fileInput.addEventListener("change", () => {
   uploadFiles(els.fileInput.files);

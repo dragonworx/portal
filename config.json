@@ -1,5 +1,5 @@
 {
-  "root": "./files",
+  "root": "./data",
   "port": 4000,
   "host": "0.0.0.0",
   "maxUploadBytes": 5368709120

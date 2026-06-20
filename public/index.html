@@ -54,9 +54,26 @@
 
       <div class="toolbar-right">
         <span id="selection-summary" class="muted">No items selected</span>
+        <button id="btn-cut" class="btn ghost" disabled title="Cut (⌘/Ctrl+X)">✂ Cut</button>
+        <button id="btn-copy" class="btn ghost" disabled title="Copy (⌘/Ctrl+C)">❐ Copy</button>
         <button id="btn-download" class="btn primary" disabled>Download</button>
       </div>
     </section>
+
+    <div class="clipboard-chip" id="clipboard-chip" hidden role="status" aria-live="polite">
+      <span class="chip-icon" id="chip-icon" aria-hidden="true">✂</span>
+      <span class="chip-text">
+        <strong id="chip-mode">Move</strong>
+        <span id="chip-summary">0 items</span>
+        <span class="chip-from">from <code id="chip-from">/</code></span>
+      </span>
+      <div class="chip-actions">
+        <button id="btn-paste" class="btn primary tiny" title="Paste into current folder (⌘/Ctrl+V)">
+          📋 Paste here
+        </button>
+        <button id="btn-clipboard-clear" class="btn ghost tiny" title="Clear (Esc)">Clear</button>
+      </div>
+    </div>
 
     <main class="listing" id="listing">
       <div class="list-header">

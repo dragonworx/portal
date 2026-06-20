@@ -154,6 +154,79 @@ body {
 .btn.tiny { padding: 3px 8px; font-size: 11px; }
 .upload-label { cursor: pointer; }
 
+/* ---------- Clipboard chip (pending move/copy banner) ---------- */
+.clipboard-chip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: linear-gradient(
+    to right,
+    rgba(91, 141, 239, 0.10),
+    rgba(91, 141, 239, 0.02)
+  );
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  font-size: 13px;
+  animation: chip-in 0.15s ease-out;
+}
+.clipboard-chip.is-copy {
+  background: linear-gradient(
+    to right,
+    rgba(62, 194, 143, 0.10),
+    rgba(62, 194, 143, 0.02)
+  );
+  border-left-color: var(--good);
+}
+@keyframes chip-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.chip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--accent);
+  flex: 0 0 24px;
+}
+.clipboard-chip.is-copy .chip-icon { color: var(--good); }
+.chip-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chip-text strong { font-weight: 600; }
+.chip-from {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chip-from code {
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+.chip-actions {
+  display: inline-flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
 /* ---------- Listing ---------- */
 .listing {
   display: grid;
@@ -199,6 +272,26 @@ body {
 }
 .row:hover { background: var(--bg-row-hover); }
 .row.selected { background: var(--bg-row-selected); }
+/* Entries queued for a pending Move look "lifted" — half-opacity with a
+   dashed left edge so the user can tell at a glance what's about to move. */
+.row.clipped {
+  opacity: 0.55;
+}
+.row.clipped .cell-name::before {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 18px;
+  margin-right: 6px;
+  background: repeating-linear-gradient(
+    to bottom,
+    var(--accent) 0,
+    var(--accent) 3px,
+    transparent 3px,
+    transparent 6px
+  );
+  vertical-align: middle;
+}
 
 .row .cell-name {
   display: flex; align-items: center; gap: 8px;

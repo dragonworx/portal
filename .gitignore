@@ -1,7 +1,10 @@
 node_modules
 bun.lockb
 .DS_Store
-files/
+# Served root for both Docker (./data → /data via compose mount) and the
+# bun-direct path (default `root` in config.json). Contents are runtime
+# data; never commit them.
+data/
 *.log
 
 # Local secrets — never commit. .env.example is the template.

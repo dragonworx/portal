@@ -11,7 +11,7 @@ scrolling so very large folders stay snappy.
 
 ```json
 {
-  "root": "./files",            // path served by the portal
+  "root": "./data",             // path served by the portal
   "port": 4000,
   "host": "0.0.0.0",
   "maxUploadBytes": 5368709120  // 5 GB per file
@@ -422,7 +422,7 @@ door in. Open the public ports (80/443) on the server firewall and *close*
 Edit `config.json`:
 
 ```json
-{ "host": "127.0.0.1", "port": 4000, "root": "./files", "maxUploadBytes": 5368709120 }
+{ "host": "127.0.0.1", "port": 4000, "root": "./data", "maxUploadBytes": 5368709120 }
 ```
 
 ### 2. nginx server block
