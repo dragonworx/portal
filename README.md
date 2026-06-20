@@ -7,35 +7,34 @@ scrolling so very large folders stay snappy.
 
 ## Configure
 
-Edit `config.json`:
+`config.json` holds the non-secret app settings:
 
 ```json
 {
-  "root": "./files",           // path served by the portal
+  "root": "./files",            // path served by the portal
   "port": 4000,
   "host": "0.0.0.0",
-  "maxUploadBytes": 5368709120, // 5 GB per file
-  "auth": {
-    "enabled": false,           // turn on once the values below are filled in
-    "clientId": "",             // Google OAuth client ID
-    "clientSecret": "",         // Google OAuth client secret
-    "publicUrl": "",            // e.g. https://portal.example.com
-    "allowedEmails": [],        // exact match, case-insensitive
-    "allowedDomains": [],       // e.g. ["example.com"] — optional
-    "sessionSecret": "",        // ≥32 chars; `openssl rand -base64 48`
-    "cookieSecure": true,       // false only for http://localhost dev
-    "sessionTtlSeconds": 604800 // 7 days
-  }
+  "maxUploadBytes": 5368709120  // 5 GB per file
 }
 ```
 
 The root folder is created if it does not exist.
 
-Every value can be overridden by an env var:
+Everything else — in particular every auth credential — lives in a `.env`
+file that Bun loads automatically at startup. Copy the template and fill it
+in:
+
+```sh
+cp .env.example .env
+# edit .env
+```
+
+`.env` is gitignored and excluded from the Docker build context; the
+template (`.env.example`) is what you commit.
 
 | Env var                    | Purpose                                  |
 | -------------------------- | ---------------------------------------- |
-| `PORTAL_ROOT`              | Root folder served by the portal         |
+| `PORTAL_ROOT`              | Root folder served by the portal (overrides config.json) |
 | `PORTAL_PORT`              | Bind port                                |
 | `PORTAL_HOST`              | Bind host                                |
 | `PORTAL_MAX_UPLOAD_BYTES`  | Max per-file upload size                 |
@@ -189,10 +188,11 @@ you must:
 - allow inbound TCP on the chosen port in your server's firewall / cloud
   security group (`sudo ufw allow 4000/tcp`, AWS SG rule, etc.).
 
-> **Authentication is opt-in.** When `auth.enabled` is `false` (the default)
-> anyone who can reach the port can browse, upload, and download to the
-> configured root. Either keep it on a trusted network, enable Google sign-in
-> (below), or front it with another auth layer (see *Deploying behind nginx*).
+> **Authentication is opt-in.** When `PORTAL_AUTH_ENABLED` is unset or false
+> (the default) anyone who can reach the port can browse, upload, and
+> download to the configured root. Either keep it on a trusted network,
+> enable Google sign-in (below), or front it with another auth layer (see
+> *Deploying behind nginx*).
 
 ## Authentication (Google sign-in)
 
@@ -218,28 +218,32 @@ This 64-character string is the HMAC key for session cookies. Treat it like a
 password — anyone with it can forge sessions. Rotate it to forcibly sign
 everyone out.
 
-### 3. Fill in `config.json`
+### 3. Fill in `.env`
 
-```json
-{
-  "auth": {
-    "enabled": true,
-    "clientId": "1234567890-xxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com",
-    "clientSecret": "GOCSPX-xxxxxxxxxxxxxxxxxxxxxx",
-    "publicUrl": "https://portal.example.com",
-    "allowedEmails": ["alice@example.com", "bob@example.com"],
-    "allowedDomains": [],
-    "sessionSecret": "paste-the-openssl-rand-output-here",
-    "cookieSecure": true,
-    "sessionTtlSeconds": 604800
-  }
-}
+```sh
+cp .env.example .env
 ```
 
-For container deployments, prefer env vars (see the table above) so secrets
-don't have to live in `config.json`.
+Then edit the file:
 
-> `publicUrl` **must** match exactly what you registered with Google
+```dotenv
+PORTAL_AUTH_ENABLED=true
+GOOGLE_CLIENT_ID=1234567890-xxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxxxxxxxxxxx
+PORTAL_PUBLIC_URL=https://portal.example.com
+PORTAL_ALLOWED_EMAILS=alice@example.com,bob@example.com
+PORTAL_ALLOWED_DOMAINS=
+PORTAL_SESSION_SECRET=paste-the-openssl-rand-output-here
+PORTAL_COOKIE_SECURE=true
+PORTAL_SESSION_TTL=604800
+```
+
+Bun loads `.env` automatically when it starts the server; the Docker compose
+stack picks it up via `env_file`. Never commit `.env` — it's gitignored and
+excluded from the Docker build context. Use `.env.example` as the canonical
+template for new deployments.
+
+> `PORTAL_PUBLIC_URL` **must** match exactly what you registered with Google
 > (including the scheme and port) — that's what's sent to the token endpoint
 > as the `redirect_uri`.
 
@@ -259,11 +263,11 @@ browser. Email addresses that aren't on the allowlist see a friendly
 
 ### Local development with auth
 
-Google's OAuth flow requires a stable redirect URI. For local dev:
+Google's OAuth flow requires a stable redirect URI. For local dev, in `.env`:
 
-- set `publicUrl` to `http://localhost:4000`
-- set `cookieSecure` to `false` (or `PORTAL_COOKIE_SECURE=false`) so the
-  browser will accept cookies over plain HTTP
+- set `PORTAL_PUBLIC_URL=http://localhost:4000`
+- set `PORTAL_COOKIE_SECURE=false` so the browser will accept cookies over
+  plain HTTP
 - add `http://localhost:4000/auth/callback` to the OAuth client's authorised
   redirect URIs
 
@@ -365,13 +369,15 @@ others so a slip in any single check doesn't open a hole.
 
 ### Pre-deploy checklist
 
-- [ ] `auth.enabled` is `true` and `allowedEmails`/`allowedDomains` is
-      populated.
-- [ ] `sessionSecret` is from `openssl rand -base64 48`, not a guessable
-      string, and is **not** committed to source control.
-- [ ] `publicUrl` is `https://…` and matches the OAuth client's
+- [ ] `PORTAL_AUTH_ENABLED=true` and `PORTAL_ALLOWED_EMAILS` /
+      `PORTAL_ALLOWED_DOMAINS` is populated.
+- [ ] `PORTAL_SESSION_SECRET` is from `openssl rand -base64 48`, not a
+      guessable string, and is **not** committed to source control.
+- [ ] `PORTAL_PUBLIC_URL` is `https://…` and matches the OAuth client's
       authorised redirect URI exactly.
-- [ ] `cookieSecure` is `true`.
+- [ ] `PORTAL_COOKIE_SECURE=true`.
+- [ ] `.env` lives only on the deployment host (gitignored,
+      dockerignored) and is readable only by the Portal service user.
 - [ ] Portal is behind HTTPS (nginx / Caddy / cloud load balancer).
 - [ ] Bun runs as an unprivileged user with `ProtectSystem=strict` +
       `ReadWritePaths` scoped to the file root.
@@ -393,7 +399,7 @@ others so a slip in any single check doesn't open a hole.
 | GET    | `/auth/callback`                  | OAuth callback (called by Google)        | no   |
 | GET    | `/auth/logout`                    | Clear session cookies                    | no   |
 
-When `auth.enabled` is `true`, every `POST` must include the
+When `PORTAL_AUTH_ENABLED` is `true`, every `POST` must include the
 `X-CSRF-Token` header matching the `portal_csrf` cookie.
 
 ## Deploying behind nginx

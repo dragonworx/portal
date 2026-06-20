@@ -8,3 +8,7 @@ README.md
 docker-compose.yml
 .dockerignore
 Dockerfile
+# Secrets stay on the host; the container receives them via env_file / -e.
+.env
+.env.local
+.env.*.local

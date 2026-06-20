@@ -2,17 +2,6 @@
   "root": "./files",
   "port": 4000,
   "host": "0.0.0.0",
-  "maxUploadBytes": 5368709120,
-  "auth": {
-    "enabled": false,
-    "clientId": "",
-    "clientSecret": "",
-    "publicUrl": "",
-    "allowedEmails": [],
-    "allowedDomains": [],
-    "sessionSecret": "",
-    "cookieSecure": true,
-    "sessionTtlSeconds": 604800
-  }
+  "maxUploadBytes": 5368709120
 }
 

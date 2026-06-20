@@ -1,4 +1,4 @@
-import { stat, readdir, mkdir } from "node:fs/promises";
+import { stat, readdir, mkdir, rm, rename } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { Readable } from "node:stream";
 import { basename, dirname, join } from "node:path";
@@ -372,6 +372,85 @@ async function handleMkdir(req: Request): Promise<Response> {
   return json({ ok: true });
 }
 
+async function handleDelete(req: Request): Promise<Response> {
+  const body = (await readJsonLimited(req, JSON_BODY_LIMIT)) as {
+    path?: unknown;
+  };
+  if (typeof body.path !== "string" || body.path.length === 0) {
+    return json({ error: "path required" }, { status: 400 });
+  }
+  const target = safeResolve(config.root, body.path, true);
+  if (target === config.root) {
+    return json({ error: "cannot delete root" }, { status: 400 });
+  }
+  // recursive: covers non-empty directories; force: tolerate races where the
+  // entry vanished between listing and confirmation.
+  await rm(target, { recursive: true, force: true });
+  return json({ ok: true });
+}
+
+async function handleRename(req: Request): Promise<Response> {
+  const body = (await readJsonLimited(req, JSON_BODY_LIMIT)) as {
+    path?: unknown;
+    newName?: unknown;
+  };
+  if (typeof body.path !== "string" || body.path.length === 0) {
+    return json({ error: "path required" }, { status: 400 });
+  }
+  if (typeof body.newName !== "string") {
+    return json({ error: "newName required" }, { status: 400 });
+  }
+  const newName = body.newName.trim();
+  const nameErr = invalidBaseName(newName);
+  if (nameErr) {
+    return json({ error: nameErr }, { status: 400 });
+  }
+
+  const source = safeResolve(config.root, body.path, true);
+  if (source === config.root) {
+    return json({ error: "cannot rename root" }, { status: 400 });
+  }
+  if (basename(source) === newName) {
+    return json({ ok: true, name: newName });
+  }
+
+  const parentRel = toRelative(config.root, dirname(source));
+  const dest = safeResolve(
+    config.root,
+    parentRel ? `${parentRel}/${newName}` : newName,
+    false,
+  );
+  if (dirname(dest) !== dirname(source)) {
+    return json({ error: "invalid destination" }, { status: 400 });
+  }
+
+  // Refuse to clobber an existing entry — rename(2) would silently replace
+  // files on POSIX and we'd rather surface the conflict to the user.
+  try {
+    await stat(dest);
+    return json({ error: "name already exists" }, { status: 409 });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+
+  try {
+    await rename(source, dest);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      throw new PathError("Not found", 404);
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      throw new PathError("Permission denied", 403);
+    }
+    if (code === "EXDEV") {
+      throw new PathError("Cross-device rename not supported", 400);
+    }
+    throw e;
+  }
+  return json({ ok: true, name: newName });
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Auth handlers                                                             */
 /* -------------------------------------------------------------------------- */
@@ -566,6 +645,12 @@ Bun.serve({
       }
       if (url.pathname === "/api/mkdir" && req.method === "POST") {
         return withSecurityHeaders(await handleMkdir(req));
+      }
+      if (url.pathname === "/api/delete" && req.method === "POST") {
+        return withSecurityHeaders(await handleDelete(req));
+      }
+      if (url.pathname === "/api/rename" && req.method === "POST") {
+        return withSecurityHeaders(await handleRename(req));
       }
 
       // --- Static client ------------------------------------------------------

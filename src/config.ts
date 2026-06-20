@@ -38,7 +38,7 @@ export function loadConfig(configPath: string): FullConfig {
 
   return {
     app: { root: realRoot, port, host, maxUploadBytes },
-    auth: loadAuthConfig(raw),
+    auth: loadAuthConfig(),
   };
 }
 

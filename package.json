@@ -11,7 +11,8 @@
     "docker:up": "docker compose up -d && docker compose logs -f",
     "docker:down": "docker compose down",
     "docker:watch": "docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build",
-    "docker:publish": "npm install --omit=dev --no-audit --no-fund && docker build -t ${PORTAL_IMAGE:-ghcr.io/OWNER/portal}:${PORTAL_TAG:-latest} . && docker push ${PORTAL_IMAGE:-ghcr.io/OWNER/portal}:${PORTAL_TAG:-latest}"
+    "docker:publish": "npm install --omit=dev --no-audit --no-fund && docker build -t ${PORTAL_IMAGE:-ghcr.io/OWNER/portal}:${PORTAL_TAG:-latest} . && docker push ${PORTAL_IMAGE:-ghcr.io/OWNER/portal}:${PORTAL_TAG:-latest}",
+    "docker:refresh": "docker compose build && docker compose up -d && docker compose logs -f"
   },
   "dependencies": {
     "archiver": "^7.0.1"

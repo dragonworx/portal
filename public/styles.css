@@ -163,7 +163,7 @@ body {
 }
 .list-header, .row {
   display: grid;
-  grid-template-columns: 40px 1fr 110px 170px;
+  grid-template-columns: 40px 1fr 110px 170px 76px;
   align-items: center;
   padding: 0 16px;
   column-gap: 8px;
@@ -220,6 +220,51 @@ body {
   font-variant-numeric: tabular-nums;
   color: var(--text-dim);
   font-size: 12px;
+}
+
+/* Hover-revealed row actions (edit / delete). */
+.cell-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.row:hover .cell-actions,
+.row.editing .cell-actions,
+.cell-actions:focus-within { opacity: 1; }
+.row-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  font-family: inherit;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.row-action:hover { background: var(--bg-row-hover); color: var(--text); border-color: var(--border); }
+.row-action.danger:hover { color: var(--bad); border-color: rgba(227,93,106,0.4); }
+.row-action:disabled { opacity: 0.5; cursor: progress; }
+
+.row .name-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-row);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font: inherit;
+  outline: none;
 }
 
 .empty {

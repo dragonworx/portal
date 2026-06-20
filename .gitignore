@@ -3,3 +3,8 @@ bun.lockb
 .DS_Store
 files/
 *.log
+
+# Local secrets — never commit. .env.example is the template.
+.env
+.env.local
+.env.*.local

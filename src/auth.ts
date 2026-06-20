@@ -20,34 +20,30 @@ const STATE_TTL_SECONDS = 600; // 10 minutes — covers a typical Google sign-in
 const MIN_SECRET_LENGTH = 32;
 const ALLOWED_SESSION_SECONDS_MAX = 30 * 24 * 3600;
 
-export function loadAuthConfig(raw: Record<string, unknown> | undefined): AuthConfig {
+export function loadAuthConfig(): AuthConfig {
   const env = process.env;
-  const authRaw = (raw && typeof raw === "object" ? (raw.auth as Record<string, unknown>) : null) ?? {};
 
   const enabledExplicit = env.PORTAL_AUTH_ENABLED;
   const enabled =
-    enabledExplicit != null
-      ? enabledExplicit === "1" || enabledExplicit.toLowerCase() === "true"
-      : Boolean(authRaw.enabled ?? false);
+    enabledExplicit != null &&
+    (enabledExplicit === "1" || enabledExplicit.toLowerCase() === "true");
 
-  const clientId = String(env.GOOGLE_CLIENT_ID ?? authRaw.clientId ?? "");
-  const clientSecret = String(env.GOOGLE_CLIENT_SECRET ?? authRaw.clientSecret ?? "");
-  const publicUrl = String(env.PORTAL_PUBLIC_URL ?? authRaw.publicUrl ?? "").replace(/\/+$/, "");
+  const clientId = String(env.GOOGLE_CLIENT_ID ?? "");
+  const clientSecret = String(env.GOOGLE_CLIENT_SECRET ?? "");
+  const publicUrl = String(env.PORTAL_PUBLIC_URL ?? "").replace(/\/+$/, "");
 
   const allowedEmails = new Set(
-    parseList(env.PORTAL_ALLOWED_EMAILS, authRaw.allowedEmails)
+    parseList(env.PORTAL_ALLOWED_EMAILS)
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
   );
   const allowedDomains = new Set(
-    parseList(env.PORTAL_ALLOWED_DOMAINS, authRaw.allowedDomains)
+    parseList(env.PORTAL_ALLOWED_DOMAINS)
       .map((s) => s.trim().toLowerCase().replace(/^@/, ""))
       .filter(Boolean),
   );
 
-  let sessionTtlSeconds = Number(
-    env.PORTAL_SESSION_TTL ?? authRaw.sessionTtlSeconds ?? 7 * 24 * 3600,
-  );
+  let sessionTtlSeconds = Number(env.PORTAL_SESSION_TTL ?? 7 * 24 * 3600);
   if (!Number.isFinite(sessionTtlSeconds) || sessionTtlSeconds <= 0) {
     sessionTtlSeconds = 7 * 24 * 3600;
   }
@@ -57,41 +53,42 @@ export function loadAuthConfig(raw: Record<string, unknown> | undefined): AuthCo
   const cookieSecure =
     cookieSecureEnv != null
       ? cookieSecureEnv === "1" || cookieSecureEnv.toLowerCase() === "true"
-      : Boolean(authRaw.cookieSecure ?? true);
+      : true;
 
-  const secretRaw = String(env.PORTAL_SESSION_SECRET ?? authRaw.sessionSecret ?? "");
+  const secretRaw = String(env.PORTAL_SESSION_SECRET ?? "");
   if (enabled) {
     if (!clientId || !clientSecret) {
       throw new Error(
-        "auth.enabled is true but Google OAuth credentials are missing " +
-          "(set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET or auth.clientId / auth.clientSecret)",
+        "PORTAL_AUTH_ENABLED is true but Google OAuth credentials are missing " +
+          "(set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env)",
       );
     }
     if (!publicUrl) {
       throw new Error(
-        "auth.enabled is true but publicUrl is missing " +
-          "(set PORTAL_PUBLIC_URL or auth.publicUrl, e.g. https://portal.example.com)",
+        "PORTAL_AUTH_ENABLED is true but PORTAL_PUBLIC_URL is missing " +
+          "(e.g. PORTAL_PUBLIC_URL=https://portal.example.com)",
       );
     }
     if (!/^https?:\/\//.test(publicUrl)) {
-      throw new Error("auth.publicUrl must start with http:// or https://");
+      throw new Error("PORTAL_PUBLIC_URL must start with http:// or https://");
     }
     if (publicUrl.startsWith("http://") && cookieSecure) {
       throw new Error(
-        "auth.cookieSecure is true but publicUrl is http://; set PORTAL_COOKIE_SECURE=false " +
-          "for plain-HTTP dev, or use https:// in production",
+        "PORTAL_COOKIE_SECURE is true but PORTAL_PUBLIC_URL is http://; set " +
+          "PORTAL_COOKIE_SECURE=false for plain-HTTP dev, or use https:// in production",
       );
     }
     if (secretRaw.length < MIN_SECRET_LENGTH) {
       throw new Error(
-        `auth.sessionSecret must be at least ${MIN_SECRET_LENGTH} characters; ` +
+        `PORTAL_SESSION_SECRET must be at least ${MIN_SECRET_LENGTH} characters; ` +
           "generate one with: openssl rand -base64 48",
       );
     }
     if (allowedEmails.size === 0 && allowedDomains.size === 0) {
       throw new Error(
-        "auth.enabled is true but no allowedEmails or allowedDomains are configured; " +
-          "this would leave the portal accessible to anyone with a Google account",
+        "PORTAL_AUTH_ENABLED is true but no PORTAL_ALLOWED_EMAILS or " +
+          "PORTAL_ALLOWED_DOMAINS are configured; this would leave the portal " +
+          "accessible to anyone with a Google account",
       );
     }
   }
@@ -109,10 +106,8 @@ export function loadAuthConfig(raw: Record<string, unknown> | undefined): AuthCo
   };
 }
 
-function parseList(envVal: string | undefined, configVal: unknown): string[] {
+function parseList(envVal: string | undefined): string[] {
   if (envVal && envVal.length > 0) return envVal.split(",");
-  if (Array.isArray(configVal)) return configVal.map((v) => String(v));
-  if (typeof configVal === "string") return configVal.split(",");
   return [];
 }
 

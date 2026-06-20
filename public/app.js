@@ -35,6 +35,10 @@ const state = {
   /** @type {Set<string>} */ selected: new Set(),
   /** @type {string} */ filter: "",
   /** @type {boolean} */ connected: false,
+  /** Inline rename state: { name, value } | null. `name` is the original
+   *  entry name we're editing; `value` mirrors the live <input> contents so
+   *  the virtualised list can recreate the row mid-edit without losing it. */
+  /** @type {{name:string,value:string}|null} */ editing: null,
 };
 
 /* -------------------------------------------------------------------------- */
@@ -166,6 +170,7 @@ async function loadPath(path) {
     state.path = data.path;
     state.entries = data.entries;
     state.selected.clear();
+    state.editing = null;
     els.filter.value = "";
     state.filter = "";
     renderCrumbs();
@@ -246,6 +251,8 @@ function buildRow(entry, index) {
   row.className = `row ${entry.type}`;
   row.dataset.name = entry.name;
   if (state.selected.has(entry.name)) row.classList.add("selected");
+  const isEditing = state.editing && state.editing.name === entry.name;
+  if (isEditing) row.classList.add("editing");
 
   const check = document.createElement("label");
   check.className = "cell cell-check";
@@ -261,10 +268,48 @@ function buildRow(entry, index) {
   const icon = document.createElement("span");
   icon.className = "icon";
   icon.textContent = iconFor(entry);
-  const label = document.createElement("span");
-  label.className = "name";
-  label.textContent = entry.name;
-  name.append(icon, label);
+  name.append(icon);
+
+  if (isEditing) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "name-input";
+    input.value = state.editing.value;
+    input.spellcheck = false;
+    input.autocapitalize = "off";
+    input.autocomplete = "off";
+    input.addEventListener("click", (ev) => ev.stopPropagation());
+    input.addEventListener("input", () => {
+      if (state.editing) state.editing.value = input.value;
+    });
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        commitRename(entry);
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        cancelRename();
+      }
+    });
+    input.addEventListener("blur", () => {
+      // Treat blur as cancel — commits are explicit (Enter or the save
+      // button). Avoids accidental renames from focus shifts.
+      if (state.editing && state.editing.name === entry.name) cancelRename();
+    });
+    name.appendChild(input);
+    // Focus + select base name (sans extension) once the row is in the DOM.
+    queueMicrotask(() => {
+      input.focus();
+      const dot = entry.type === "file" ? entry.name.lastIndexOf(".") : -1;
+      if (dot > 0) input.setSelectionRange(0, dot);
+      else input.select();
+    });
+  } else {
+    const label = document.createElement("span");
+    label.className = "name";
+    label.textContent = entry.name;
+    name.appendChild(label);
+  }
 
   const size = document.createElement("div");
   size.className = "cell cell-size";
@@ -274,11 +319,36 @@ function buildRow(entry, index) {
   mtime.className = "cell cell-mtime";
   mtime.textContent = fmtTime(entry.mtime);
 
-  row.append(check, name, size, mtime);
+  const actions = document.createElement("div");
+  actions.className = "cell cell-actions";
+  const editBtn = document.createElement("button");
+  editBtn.type = "button";
+  editBtn.className = "row-action";
+  editBtn.title = "Rename";
+  editBtn.setAttribute("aria-label", `Rename ${entry.name}`);
+  editBtn.textContent = "✎";
+  editBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    beginRename(entry);
+  });
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.className = "row-action danger";
+  delBtn.title = "Delete";
+  delBtn.setAttribute("aria-label", `Delete ${entry.name}`);
+  delBtn.textContent = "🗑";
+  delBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    deleteEntry(entry);
+  });
+  actions.append(editBtn, delBtn);
+
+  row.append(check, name, size, mtime, actions);
 
   // Single click on a dir drills in; on a file it toggles selection.
   row.addEventListener("click", (ev) => {
     if (ev.target === cb) return;
+    if (isEditing) return;
     if (entry.type === "dir") {
       const next = state.path ? `${state.path}/${entry.name}` : entry.name;
       loadPath(next);
@@ -322,6 +392,87 @@ function renderSelection() {
     if (files) parts.push(`${files} file${files === 1 ? "" : "s"}`);
     if (dirs) parts.push(`${dirs} folder${dirs === 1 ? "" : "s"}`);
     els.selSummary.textContent = `${parts.join(", ")} • ${fmtSize(totalBytes)}${dirs ? "+" : ""}`;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Rename / delete                                                           */
+/* -------------------------------------------------------------------------- */
+
+function beginRename(entry) {
+  state.editing = { name: entry.name, value: entry.name };
+  renderVisible();
+}
+
+function cancelRename() {
+  if (!state.editing) return;
+  state.editing = null;
+  renderVisible();
+}
+
+async function commitRename(entry) {
+  if (!state.editing || state.editing.name !== entry.name) return;
+  const original = entry.name;
+  const next = state.editing.value.trim();
+  if (!next || next === original) {
+    cancelRename();
+    return;
+  }
+  // Optimistically clear the editing state so the row re-renders as plain text;
+  // on failure we'll revert by re-entering edit mode with the typed value.
+  const attempted = next;
+  state.editing = null;
+  renderVisible();
+  try {
+    const res = await api("/api/rename", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: joinPath(original), newName: attempted }),
+    });
+    const data = await res.json();
+    const newName = data?.name || attempted;
+    // Update in place so selection and scroll position survive.
+    const idx = state.entries.findIndex((e) => e.name === original);
+    if (idx !== -1) {
+      state.entries[idx] = { ...state.entries[idx], name: newName };
+      if (state.selected.delete(original)) state.selected.add(newName);
+    }
+    renderList();
+    renderSelection();
+  } catch (err) {
+    alert(`Rename failed: ${err.message}`);
+    // Revert: re-open the editor on the original row with what the user typed
+    // so they can correct and retry without retyping from scratch.
+    if (state.entries.some((e) => e.name === original)) {
+      state.editing = { name: original, value: attempted };
+      renderVisible();
+    } else {
+      // Entry disappeared (e.g. deleted elsewhere) — refresh the listing.
+      loadPath(state.path);
+    }
+  }
+}
+
+async function deleteEntry(entry) {
+  const kind = entry.type === "dir" ? "folder" : "file";
+  const warn =
+    entry.type === "dir"
+      ? `Delete folder “${entry.name}” and everything inside it?\n\nThis cannot be undone.`
+      : `Delete file “${entry.name}”?\n\nThis cannot be undone.`;
+  if (!confirm(warn)) return;
+  try {
+    await api("/api/delete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: joinPath(entry.name) }),
+    });
+    state.entries = state.entries.filter((e) => e.name !== entry.name);
+    state.selected.delete(entry.name);
+    if (state.editing && state.editing.name === entry.name) state.editing = null;
+    renderList();
+    renderSelection();
+  } catch (err) {
+    alert(`Could not delete ${kind}: ${err.message}`);
   }
 }
 
