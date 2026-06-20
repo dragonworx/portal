@@ -1,5 +1,7 @@
 import { resolve, normalize, sep, join, relative, isAbsolute } from "node:path";
-import { realpathSync, existsSync, mkdirSync } from "node:fs";
+import { realpathSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+
+import { loadAuthConfig, type AuthConfig } from "./auth.ts";
 
 export interface AppConfig {
   root: string;
@@ -8,12 +10,17 @@ export interface AppConfig {
   maxUploadBytes: number;
 }
 
-export function loadConfig(configPath: string): AppConfig {
+export interface FullConfig {
+  app: AppConfig;
+  auth: AuthConfig;
+}
+
+export function loadConfig(configPath: string): FullConfig {
   // The config file is optional when every value is supplied via env vars
   // (the usual case in container deployments).
   let raw: Record<string, unknown> = {};
   if (existsSync(configPath)) {
-    raw = JSON.parse(require("node:fs").readFileSync(configPath, "utf8"));
+    raw = JSON.parse(readFileSync(configPath, "utf8"));
   }
 
   const rootRaw = (process.env.PORTAL_ROOT ?? (raw.root as string) ?? "./files");
@@ -29,7 +36,10 @@ export function loadConfig(configPath: string): AppConfig {
     process.env.PORTAL_MAX_UPLOAD_BYTES ?? raw.maxUploadBytes ?? 5 * 1024 * 1024 * 1024,
   );
 
-  return { root: realRoot, port, host, maxUploadBytes };
+  return {
+    app: { root: realRoot, port, host, maxUploadBytes },
+    auth: loadAuthConfig(raw),
+  };
 }
 
 /**

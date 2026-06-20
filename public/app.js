@@ -22,6 +22,8 @@ const els = {
   uploadsClear: document.getElementById("uploads-clear"),
   dropzone: document.getElementById("dropzone"),
   dropzonePath: document.getElementById("dropzone-path"),
+  user: document.getElementById("user"),
+  userEmail: document.getElementById("user-email"),
 };
 
 const ROW_HEIGHT = 40;
@@ -74,8 +76,35 @@ function iconFor(entry) {
 /*  Networking                                                                */
 /* -------------------------------------------------------------------------- */
 
+// Read the portal_csrf cookie set by the server at sign-in time and echo it
+// back as the X-CSRF-Token header on every state-changing request. Combined
+// with the SameSite=Lax session cookie this gives us defence-in-depth CSRF
+// protection (double-submit cookie).
+function getCsrfToken() {
+  const m = document.cookie.match(/(?:^|;\s*)portal_csrf=([^;]+)/);
+  return m ? m[1] : "";
+}
+
+function redirectToLogin() {
+  const here = location.pathname + location.search + location.hash;
+  location.href = "/login?returnTo=" + encodeURIComponent(here);
+}
+
 async function api(path, opts) {
-  const res = await fetch(path, opts);
+  const init = opts ? { ...opts } : {};
+  const method = (init.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    const csrf = getCsrfToken();
+    if (csrf) {
+      init.headers = { ...(init.headers || {}), "x-csrf-token": csrf };
+    }
+  }
+  init.credentials = "same-origin";
+  const res = await fetch(path, init);
+  if (res.status === 401) {
+    redirectToLogin();
+    throw new Error("unauthorized");
+  }
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
     try {
@@ -87,6 +116,26 @@ async function api(path, opts) {
     throw new Error(msg);
   }
   return res;
+}
+
+async function loadMe() {
+  try {
+    const res = await fetch("/api/me", { credentials: "same-origin" });
+    if (res.status === 401) {
+      redirectToLogin();
+      return;
+    }
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data && data.authEnabled && data.email && els.user) {
+      // textContent — server-supplied email is not interpreted as HTML.
+      els.userEmail.textContent = data.email;
+      els.userEmail.title = data.email;
+      els.user.hidden = false;
+    }
+  } catch {
+    /* ignore — not a fatal error */
+  }
 }
 
 async function ping() {
@@ -364,7 +413,10 @@ function uploadOne(file) {
     file.name,
   )}`;
   xhr.open("POST", url, true);
+  xhr.withCredentials = true;
   xhr.setRequestHeader("content-type", "application/octet-stream");
+  const csrf = getCsrfToken();
+  if (csrf) xhr.setRequestHeader("x-csrf-token", csrf);
 
   xhr.upload.addEventListener("progress", (ev) => {
     if (!ev.lengthComputable) return;
@@ -381,6 +433,11 @@ function uploadOne(file) {
       state_.textContent = `done • ${fmtSize(file.size)}`;
       // Refresh listing if we uploaded into the folder we're viewing.
       if (targetDir === state.path) loadPath(state.path);
+    } else if (xhr.status === 401) {
+      li.classList.add("err");
+      state_.classList.add("err");
+      state_.textContent = "signed out";
+      redirectToLogin();
     } else {
       li.classList.add("err");
       state_.classList.add("err");
@@ -513,6 +570,7 @@ function pathFromHash() {
 /*  Boot                                                                      */
 /* -------------------------------------------------------------------------- */
 
+loadMe();
 ping();
 setInterval(ping, 5000);
 loadPath(pathFromHash());

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Sign in · Portal</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="login-body">
+    <main class="login-card">
+      <div class="brand login-brand">
+        <span class="logo" aria-hidden="true">▣</span>
+        <span class="brand-name">Portal</span>
+      </div>
+      <h1 class="login-title">Sign in</h1>
+      <p class="login-sub">
+        Sign in with a Google account that has been authorised for this portal.
+      </p>
+      <p id="login-error" class="login-error" hidden></p>
+      <a class="btn primary login-btn" href="/auth/login" id="login-btn">
+        Sign in with Google
+      </a>
+      <p class="login-foot muted">
+        You'll be redirected to Google to complete sign-in.
+      </p>
+    </main>
+    <script src="/login.js"></script>
+  </body>
+</html>

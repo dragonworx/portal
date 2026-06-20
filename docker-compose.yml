@@ -28,3 +28,16 @@ services:
       # PORTAL_PORT: "4000"
       # PORTAL_HOST: "0.0.0.0"
 
+      # --- Google OAuth + email whitelist ---
+      # Set PORTAL_AUTH_ENABLED=true once the values below are filled in.
+      # PORTAL_AUTH_ENABLED: "true"
+      # GOOGLE_CLIENT_ID: "xxxxxxxx.apps.googleusercontent.com"
+      # GOOGLE_CLIENT_SECRET: "GOCSPX-..."
+      # PORTAL_PUBLIC_URL: "https://portal.example.com"
+      # PORTAL_ALLOWED_EMAILS: "alice@example.com,bob@example.com"
+      # PORTAL_ALLOWED_DOMAINS: ""    # or e.g. "example.com"
+      # PORTAL_SESSION_SECRET: "use `openssl rand -base64 48` and paste here"
+      # PORTAL_COOKIE_SECURE: "true"  # set to "false" only for http:// dev
+      # PORTAL_SESSION_TTL: "604800"  # session lifetime in seconds (default 7d)
+
+
