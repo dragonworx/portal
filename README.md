@@ -5,15 +5,6 @@ folder, then use the browser client to browse, upload, and download files. The
 client uses a drilldown (one folder at a time) rather than a tree, with virtual
 scrolling so very large folders stay snappy.
 
-## Install
-
-```sh
-bun install
-# If your machine is behind a proxy that blocks Bun's installer, use npm —
-# it produces a node_modules Bun can run against:
-#   npm install --no-audit --no-fund
-```
-
 ## Configure
 
 Edit `config.json`:
@@ -58,11 +49,132 @@ Every value can be overridden by an env var:
 | `PORTAL_COOKIE_SECURE`     | `true` (default) — requires HTTPS        |
 | `PORTAL_SESSION_TTL`       | Session lifetime in seconds              |
 
-## Run
+## Run with Docker (recommended)
+
+Docker is the recommended way to run Portal: no Bun on the host, no proxy
+headaches, and the container ships with sensible defaults (binds to
+loopback, drops to a non-root user, volume-mounts your file root, has a
+healthcheck wired to `/api/ping`).
+
+The whole lifecycle is wrapped in `docker:*` npm scripts so you don't have
+to remember the compose invocations:
+
+| Script                | Does                                                                 |
+| --------------------- | -------------------------------------------------------------------- |
+| `bun run docker:build`| `docker compose build` — build the image from the local `Dockerfile` |
+| `bun run docker:up`   | `docker compose up -d` then tails logs in the foreground             |
+| `bun run docker:down` | `docker compose down` — stop and remove the container                |
+| `bun run docker:watch`| Brings the stack up with `bun --hot` and bind-mounted source for dev |
+| `bun run docker:publish`| Build + push to a registry (override with `PORTAL_IMAGE` / `PORTAL_TAG`) |
+
+You can call `docker compose …` directly instead — the scripts are just
+shortcuts.
+
+### Option 1 — Pull a pre-built image (recommended)
+
+> **Note:** Portal does not currently publish an official image. Replace
+> `ghcr.io/OWNER/portal:latest` below with whatever you publish via
+> `bun run docker:publish` (see *Publishing your own image* further down).
+
+You only need `docker-compose.yml` and a place for your files. No clone,
+no Bun, no Node:
 
 ```sh
+mkdir portal && cd portal
+curl -O https://raw.githubusercontent.com/OWNER/portal/main/docker-compose.yml
+mkdir data
+
+# Edit docker-compose.yml: remove the `build: .` line and uncomment the
+# `image: ghcr.io/OWNER/portal:latest` line (pointing at your registry).
+
+docker compose up -d
+```
+
+Portal is now on <http://127.0.0.1:4000> (the default `ports:` binding is
+loopback-only — drop the `127.0.0.1:` prefix in `docker-compose.yml` to
+expose it on the network). Drop files into `./data` and they appear in the
+UI; uploads land in the same folder.
+
+Upgrade by pulling the new tag and recreating the container:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+Stop and remove:
+
+```sh
+docker compose down
+```
+
+### Option 2 — Clone and build from source
+
+Use this if you want to track your own fork, modify the code, or run a
+version that isn't published.
+
+```sh
+git clone https://github.com/OWNER/portal.git
+cd portal
+
+# The Dockerfile copies a pre-installed node_modules into the image (see the
+# comment at the top of the Dockerfile for why). Run the install once on the
+# host before building:
+npm install --omit=dev --no-audit --no-fund
+
+bun run docker:build   # docker compose build
+bun run docker:up      # docker compose up -d, then tails logs
+```
+
+Rebuild after pulling new commits:
+
+```sh
+git pull
+npm install --omit=dev --no-audit --no-fund
+bun run docker:build
+bun run docker:up
+```
+
+Stop the stack with `bun run docker:down`.
+
+### Hacking on Portal itself
+
+`bun run docker:watch` brings the container up with the `src/`, `public/`,
+and `config.json` paths bind-mounted read-only, and swaps the command to
+`bun --hot` so the server reloads on every edit:
+
+```sh
+bun run docker:watch
+```
+
+Ctrl-C stops it; cleanup with `bun run docker:down`.
+
+### Publishing your own image
+
+`bun run docker:publish` installs production deps, builds the image, and
+pushes it to a registry. Override the tag with env vars:
+
+```sh
+# Defaults to ghcr.io/OWNER/portal:latest — change OWNER (and the defaults
+# in package.json) once you've decided on a real registry path.
+PORTAL_IMAGE=ghcr.io/your-org/portal PORTAL_TAG=1.2.3 bun run docker:publish
+```
+
+You'll need to `docker login` to the target registry first.
+
+## Run without Docker (Bun direct)
+
+If you'd rather run Bun straight on the host — handy for quick local
+experiments — install dependencies and start the server:
+
+```sh
+bun install
+# If your machine is behind a proxy that blocks Bun's installer, use npm —
+# it produces a node_modules Bun can run against:
+#   npm install --no-audit --no-fund
+
 bun run start
-# or, with hot reload
+# …or, with hot reload:
 bun run dev
 ```
 
@@ -154,87 +266,6 @@ Google's OAuth flow requires a stable redirect URI. For local dev:
   browser will accept cookies over plain HTTP
 - add `http://localhost:4000/auth/callback` to the OAuth client's authorised
   redirect URIs
-
-## Run with Docker
-
-Two ways to get Portal running on a server with Docker. Both use the same
-`docker-compose.yml` — the only difference is whether the image is pulled
-from a registry or built locally.
-
-### Option 1 — Pull a pre-built image (recommended)
-
-> **Note:** Portal does not currently publish an official image. Replace
-> `ghcr.io/OWNER/portal:latest` below with whatever you publish via
-> `bun run docker:publish` (see *Publishing your own image* further down).
-
-You only need `docker-compose.yml` and a place for your files. No clone,
-no Bun, no Node:
-
-```sh
-mkdir portal && cd portal
-curl -O https://raw.githubusercontent.com/OWNER/portal/main/docker-compose.yml
-mkdir data
-
-# Edit docker-compose.yml: remove the `build: .` line and uncomment the
-# `image: ghcr.io/OWNER/portal:latest` line (pointing at your registry).
-
-docker compose up -d
-```
-
-Portal is now on <http://127.0.0.1:4000> (the default `ports:` binding is
-loopback-only — drop the `127.0.0.1:` prefix in `docker-compose.yml` to
-expose it on the network). Drop files into `./data` and they appear in the
-UI; uploads land in the same folder.
-
-Upgrade by pulling the new tag and recreating the container:
-
-```sh
-docker compose pull
-docker compose up -d
-```
-
-### Option 2 — Clone and build from source
-
-Use this if you want to track your own fork, modify the code, or run a
-version that isn't published.
-
-```sh
-git clone https://github.com/OWNER/portal.git
-cd portal
-
-# The Dockerfile copies a pre-installed node_modules into the image (see the
-# comment at the top of the Dockerfile for why). Run the install once on the
-# host before building:
-npm install --omit=dev --no-audit --no-fund
-
-bun run docker:build   # docker compose build
-bun run docker:up      # docker compose up -d, then tails logs
-```
-
-Rebuild after pulling new commits:
-
-```sh
-git pull
-npm install --omit=dev --no-audit --no-fund
-bun run docker:build
-bun run docker:up
-```
-
-For working on Portal itself, `bun run docker:watch` brings the container up
-with the source folders bind-mounted and `bun --hot` watching for changes.
-
-### Publishing your own image
-
-`bun run docker:publish` installs production deps, builds the image, and
-pushes it to a registry. Override the tag with env vars:
-
-```sh
-# Defaults to ghcr.io/OWNER/portal:latest — change OWNER (and the defaults
-# in package.json) once you've decided on a real registry path.
-PORTAL_IMAGE=ghcr.io/your-org/portal PORTAL_TAG=1.2.3 bun run docker:publish
-```
-
-You'll need to `docker login` to the target registry first.
 
 ## Features
 
