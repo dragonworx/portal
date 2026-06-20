@@ -236,7 +236,7 @@ body {
 }
 .list-header, .row {
   display: grid;
-  grid-template-columns: 40px 1fr 110px 170px 76px;
+  grid-template-columns: 40px 1fr 110px 170px 108px;
   align-items: center;
   padding: 0 16px;
   column-gap: 8px;
@@ -533,5 +533,177 @@ body {
 .login-foot {
   margin: 4px 0 0;
   font-size: 11px;
+}
+
+/* ---------- Inline text editor (modal) ---------- */
+/* Lock background scroll while the editor is open. */
+body.editor-open { overflow: hidden; }
+
+.editor-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  background: rgba(8, 10, 14, 0.78);
+  backdrop-filter: blur(3px);
+  animation: editor-fade 0.12s ease-out;
+}
+@keyframes editor-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.editor-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+  border: none;
+  overflow: hidden;
+}
+
+.editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 16px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  min-height: 56px;
+}
+.editor-title-block {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.editor-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  font-size: 16px;
+  color: var(--accent);
+  flex: 0 0 32px;
+}
+.editor-title-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.editor-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.editor-subtitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 2px;
+}
+.editor-meta { display: inline-flex; align-items: center; }
+.editor-dirty { color: var(--warn); }
+
+.editor-actions {
+  display: inline-flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.editor-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 16px;
+  background: rgba(229, 176, 75, 0.12);
+  border-bottom: 1px solid rgba(229, 176, 75, 0.4);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.editor-warning-icon {
+  flex: 0 0 auto;
+  color: var(--warn);
+  font-size: 16px;
+  line-height: 1.2;
+}
+.editor-warning-msg { flex: 1 1 auto; }
+
+.editor-body {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  background: var(--bg);
+  overflow: hidden;
+}
+.editor-body .CodeMirror {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--text);
+}
+/* Skin CodeMirror's default light theme to match Portal's dark palette. */
+.editor-body .CodeMirror-gutters {
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+}
+.editor-body .CodeMirror-linenumber { color: var(--text-dim); }
+.editor-body .CodeMirror-cursor { border-left-color: var(--text); }
+.editor-body .CodeMirror-selected { background: var(--bg-row-selected) !important; }
+.editor-body .CodeMirror-focused .CodeMirror-selected {
+  background: var(--bg-row-selected) !important;
+}
+.editor-body .CodeMirror-activeline-background { background: var(--bg-row); }
+.editor-body .CodeMirror-matchingbracket {
+  color: var(--accent) !important;
+  border-bottom: 1px solid var(--accent);
+}
+/* Token colours — soft palette tuned for the dark background. */
+.editor-body .cm-keyword    { color: #c792ea; }
+.editor-body .cm-atom       { color: #f78c6c; }
+.editor-body .cm-number     { color: #f78c6c; }
+.editor-body .cm-def        { color: #82aaff; }
+.editor-body .cm-variable   { color: var(--text); }
+.editor-body .cm-variable-2 { color: #82aaff; }
+.editor-body .cm-variable-3 { color: #ffcb6b; }
+.editor-body .cm-property   { color: #82aaff; }
+.editor-body .cm-operator   { color: #89ddff; }
+.editor-body .cm-string     { color: #c3e88d; }
+.editor-body .cm-string-2   { color: #c3e88d; }
+.editor-body .cm-comment    { color: #6b7280; font-style: italic; }
+.editor-body .cm-tag        { color: #f07178; }
+.editor-body .cm-attribute  { color: #ffcb6b; }
+.editor-body .cm-meta       { color: var(--text-dim); }
+.editor-body .cm-header     { color: #82aaff; }
+.editor-body .cm-quote      { color: #89ddff; }
+.editor-body .cm-hr         { color: var(--text-dim); }
+.editor-body .cm-link       { color: var(--accent); }
+.editor-body .cm-error      { color: var(--bad); }
+
+/* Slim the editor header on narrow viewports. */
+@media (max-width: 600px) {
+  .editor-header { flex-wrap: wrap; gap: 8px; }
+  .editor-path { font-size: 12px; }
 }
 

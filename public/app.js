@@ -14,6 +14,7 @@ const els = {
   btnUp: document.getElementById("btn-up"),
   btnRefresh: document.getElementById("btn-refresh"),
   btnNewFolder: document.getElementById("btn-newfolder"),
+  btnNewFile: document.getElementById("btn-newfile"),
   btnDownload: document.getElementById("btn-download"),
   btnCut: document.getElementById("btn-cut"),
   btnCopy: document.getElementById("btn-copy"),
@@ -33,6 +34,16 @@ const els = {
   dropzonePath: document.getElementById("dropzone-path"),
   user: document.getElementById("user"),
   userEmail: document.getElementById("user-email"),
+  // Inline text editor (fullscreen modal).
+  editorModal: document.getElementById("editor-modal"),
+  editorTitle: document.getElementById("editor-title"),
+  editorMode: document.getElementById("editor-mode"),
+  editorDirty: document.getElementById("editor-dirty"),
+  editorWarning: document.getElementById("editor-warning"),
+  editorWarningMsg: document.getElementById("editor-warning-msg"),
+  editorBody: document.getElementById("editor-body"),
+  editorSave: document.getElementById("editor-save"),
+  editorCancel: document.getElementById("editor-cancel"),
 };
 
 const ROW_HEIGHT = 40;
@@ -345,6 +356,22 @@ function buildRow(entry, index) {
 
   const actions = document.createElement("div");
   actions.className = "cell cell-actions";
+  // Edit-content button (text files): opens the fullscreen editor. We show
+  // it on every file regardless of extension — the editor itself warns when
+  // the file looks binary. Hiding it for directories keeps the UI clean.
+  if (entry.type === "file") {
+    const openBtn = document.createElement("button");
+    openBtn.type = "button";
+    openBtn.className = "row-action";
+    openBtn.title = "Edit text";
+    openBtn.setAttribute("aria-label", `Edit ${entry.name}`);
+    openBtn.textContent = "📝";
+    openBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      openEditor(entry);
+    });
+    actions.append(openBtn);
+  }
   const editBtn = document.createElement("button");
   editBtn.type = "button";
   editBtn.className = "row-action";
@@ -868,6 +895,11 @@ els.btnClipboardClear.addEventListener("click", clearClipboard);
 // Keyboard shortcuts. Ignored while focus is in a text input / textarea so we
 // don't intercept the user's typing in filter / rename inputs.
 window.addEventListener("keydown", (ev) => {
+  // While the inline editor modal is open let it handle its own shortcuts
+  // (Cmd-S, Esc, copy/paste inside CodeMirror). Otherwise selecting files
+  // and then opening the editor would have Cmd-V paste them into the folder
+  // instead of into the document.
+  if (editorState.path) return;
   const t = ev.target;
   const tag = t && t.tagName;
   if (
@@ -931,6 +963,32 @@ els.btnNewFolder.addEventListener("click", async () => {
   }
 });
 
+els.btnNewFile.addEventListener("click", async () => {
+  const raw = prompt("New file name");
+  if (!raw) return;
+  const name = raw.trim();
+  if (!name) return;
+  let created;
+  try {
+    const res = await api("/api/touch", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: state.path, name }),
+    });
+    created = await res.json();
+  } catch (err) {
+    alert(`Could not create file: ${err.message}`);
+    return;
+  }
+  await loadPath(state.path);
+  // Best-effort: open the editor on the freshly-created file so the user can
+  // start typing immediately. Looks up the entry in the now-current listing
+  // rather than guessing, in case the server normalised the name.
+  const finalName = (created && created.name) || name;
+  const entry = state.entries.find((e) => e.name === finalName && e.type === "file");
+  if (entry) openEditor(entry);
+});
+
 window.addEventListener("hashchange", () => loadPath(pathFromHash()));
 
 function pathFromHash() {
@@ -943,6 +1001,370 @@ function pathFromHash() {
     .map(decodeURIComponent)
     .join("/");
 }
+
+/* -------------------------------------------------------------------------- */
+/*  Inline text editor                                                        */
+/*                                                                            */
+/*  Fullscreen modal powered by CodeMirror 5 (lazy-loaded from /vendor on     */
+/*  first use). Lets the user edit any file in place, with syntax            */
+/*  highlighting auto-detected from the filename and a clear warning banner  */
+/*  when the file looks binary (saving back would corrupt it).               */
+/* -------------------------------------------------------------------------- */
+
+/** Extensions we treat as "obviously not text". The editor still opens —
+ *  some users do legitimately want to inspect / surgically patch these —
+ *  but we surface a prominent warning and a second confirm on save. */
+const BINARY_EXTS = new Set([
+  // Images
+  "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "tif", "tiff", "heic",
+  "heif", "avif", "raw", "psd", "ai",
+  // Audio / video
+  "mp3", "mp4", "mov", "avi", "wav", "flac", "ogg", "opus", "webm", "mkv",
+  "m4a", "m4v", "aac", "wma", "wmv", "flv", "3gp",
+  // Archives
+  "zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar", "tbz2", "txz", "lz",
+  "lzma", "zst",
+  // Executables / object code / libs
+  "exe", "dll", "so", "dylib", "bin", "dat", "class", "jar", "pyc", "pyo",
+  "wasm", "o", "a", "obj", "lib",
+  // Office / PDFs / e-books
+  "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",
+  "rtf", "epub", "mobi", "azw3",
+  // Fonts
+  "woff", "woff2", "ttf", "otf", "eot",
+  // Databases / pickles
+  "sqlite", "sqlite3", "db", "mdb", "pkl", "parquet",
+]);
+
+const editorState = {
+  /** Relative path being edited, or null when the editor is closed. */
+  path: null,
+  /** Original text content used to detect "dirty" state. */
+  originalText: null,
+  /** Live CodeMirror instance (null when closed). */
+  cm: null,
+  /** True when the file looked like a binary format on open. */
+  looksBinary: false,
+};
+
+/** Promise-cached bootstrap of the CodeMirror core + meta addon. */
+let codeMirrorBootstrap = null;
+/** Per-mode promise cache so re-opening files of the same type is instant. */
+const codeMirrorModeCache = new Map();
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+function ensureCodeMirror() {
+  if (window.CodeMirror && window.CodeMirror.findModeByFileName) {
+    return Promise.resolve();
+  }
+  if (!codeMirrorBootstrap) {
+    codeMirrorBootstrap = (async () => {
+      if (!window.CodeMirror) {
+        await loadScript("/vendor/codemirror/lib/codemirror.js");
+      }
+      // Provides findModeByFileName / findModeByMIME.
+      if (!window.CodeMirror.findModeByFileName) {
+        await loadScript("/vendor/codemirror/mode/meta.js");
+      }
+    })();
+  }
+  return codeMirrorBootstrap;
+}
+
+function ensureCodeMirrorMode(modeName) {
+  if (!modeName || modeName === "null" || modeName === "plain") {
+    return Promise.resolve();
+  }
+  const cm = window.CodeMirror;
+  if (cm && cm.modes && cm.modes[modeName]) return Promise.resolve();
+  if (!codeMirrorModeCache.has(modeName)) {
+    codeMirrorModeCache.set(
+      modeName,
+      loadScript(`/vendor/codemirror/mode/${modeName}/${modeName}.js`).catch(
+        (err) => {
+          // Some "modes" returned by meta.js (e.g. dependent modes) may not
+          // resolve to a 1:1 file. Drop the cache entry so a retry is possible
+          // and let the editor fall back to plain text.
+          codeMirrorModeCache.delete(modeName);
+          throw err;
+        },
+      ),
+    );
+  }
+  return codeMirrorModeCache.get(modeName);
+}
+
+function extOf(name) {
+  const i = name.lastIndexOf(".");
+  return i >= 0 && i < name.length - 1 ? name.slice(i + 1).toLowerCase() : "";
+}
+
+/** Heuristic: does this byte buffer look like binary content?
+ *  We treat a NUL anywhere in the first 8 KB as conclusive (real text files
+ *  never contain raw NULs in UTF-8/UTF-16), and accumulate non-printable
+ *  control bytes as a softer signal. */
+function bytesLookBinary(bytes) {
+  const limit = Math.min(bytes.length, 8192);
+  let suspicious = 0;
+  for (let i = 0; i < limit; i++) {
+    const c = bytes[i];
+    if (c === 0) return true;
+    // Allow common whitespace: \t (9), \n (10), \r (13). Anything else
+    // below 0x20 or the DEL byte is suspicious.
+    if (c < 0x09 || (c > 0x0d && c < 0x20) || c === 0x7f) {
+      suspicious++;
+      if (suspicious > 32) return true;
+    }
+  }
+  return false;
+}
+
+/** Resolve the best CodeMirror mode for a given filename. */
+function detectMode(filename) {
+  const cm = window.CodeMirror;
+  if (!cm || !cm.findModeByFileName) {
+    return { name: "plain", mime: null, label: "plain text" };
+  }
+  const info = cm.findModeByFileName(filename);
+  if (info) {
+    return {
+      name: info.mode,
+      mime: info.mime,
+      label: info.name || info.mode,
+    };
+  }
+  return { name: "plain", mime: null, label: "plain text" };
+}
+
+async function openEditor(entry) {
+  if (editorState.path) return; // single-instance
+  let res;
+  try {
+    res = await api(`/api/file?path=${encodeURIComponent(joinPath(entry.name))}`);
+  } catch (err) {
+    alert(`Could not open file: ${err.message}`);
+    return;
+  }
+
+  let bytes;
+  try {
+    bytes = new Uint8Array(await res.arrayBuffer());
+  } catch (err) {
+    alert(`Could not read file: ${err.message}`);
+    return;
+  }
+
+  // Detection: extension AND content. We surface both so the warning is
+  // specific about why we think it's binary.
+  const ext = extOf(entry.name);
+  const extBinary = BINARY_EXTS.has(ext);
+  const contentBinary = bytesLookBinary(bytes);
+  const looksBinary = extBinary || contentBinary;
+
+  // Decode as UTF-8 (fatal: false so invalid sequences become U+FFFD instead
+  // of throwing — necessary for opening binary files at all).
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+
+  // CodeMirror has to be loaded before we can detect the mode (findModeByFileName
+  // is on the meta addon).
+  try {
+    await ensureCodeMirror();
+  } catch (err) {
+    alert(`Editor failed to load: ${err.message}`);
+    return;
+  }
+  const modeInfo = detectMode(entry.name);
+  if (modeInfo.name && modeInfo.name !== "plain" && modeInfo.name !== "null") {
+    try {
+      await ensureCodeMirrorMode(modeInfo.name);
+    } catch {
+      // Soft-fail: continue with plain text.
+    }
+  }
+
+  // Populate header + warning banner.
+  const fullPath = joinPath(entry.name);
+  els.editorTitle.textContent = "/" + fullPath;
+  els.editorTitle.title = "/" + fullPath;
+  els.editorMode.textContent = modeInfo.label || "plain text";
+  els.editorDirty.hidden = true;
+  if (looksBinary) {
+    const reasons = [];
+    if (extBinary) reasons.push(`".${ext}" files are normally binary`);
+    if (contentBinary) reasons.push("the file contains non-text bytes");
+    els.editorWarningMsg.textContent =
+      `Warning: ${reasons.join(" and ")}. ` +
+      "Saving will overwrite the file with whatever you see below — that will " +
+      "corrupt the original. Cancel out unless you really mean to do this.";
+    els.editorWarning.hidden = false;
+  } else {
+    els.editorWarning.hidden = true;
+    els.editorWarningMsg.textContent = "";
+  }
+
+  editorState.path = fullPath;
+  editorState.originalText = text;
+  editorState.looksBinary = looksBinary;
+
+  els.editorBody.replaceChildren();
+  els.editorModal.hidden = false;
+  document.body.classList.add("editor-open");
+
+  // Build the CodeMirror instance only once the modal is visible so it can
+  // measure layout correctly.
+  const cm = window.CodeMirror(els.editorBody, {
+    value: text,
+    mode: modeInfo.mime || modeInfo.name || "null",
+    lineNumbers: true,
+    indentUnit: 2,
+    tabSize: 2,
+    smartIndent: false,
+    lineWrapping: false,
+    viewportMargin: 50,
+    extraKeys: {
+      "Cmd-S": () => { saveEditor(); },
+      "Ctrl-S": () => { saveEditor(); },
+      "Esc": () => { closeEditor(false); },
+    },
+  });
+  // CodeMirror normalises line endings (\r\n → \n) on input, so use what
+  // it actually holds as the baseline for the dirty check — otherwise files
+  // with CRLF (or NUL bytes that get reinterpreted) appear dirty on open.
+  editorState.originalText = cm.getValue();
+  cm.setSize("100%", "100%");
+  cm.on("change", () => {
+    const dirty = cm.getValue() !== editorState.originalText;
+    els.editorDirty.hidden = !dirty;
+    els.editorSave.disabled = !dirty;
+  });
+  editorState.cm = cm;
+  els.editorSave.disabled = true;
+  // Focus after the browser has painted the layout, otherwise CodeMirror
+  // measures zero height and the cursor lands somewhere bizarre.
+  requestAnimationFrame(() => {
+    cm.refresh();
+    cm.focus();
+  });
+}
+
+async function saveEditor() {
+  if (!editorState.path || !editorState.cm) return;
+  const text = editorState.cm.getValue();
+  if (text === editorState.originalText) {
+    // No-op save: just close.
+    closeEditor(true);
+    return;
+  }
+  if (editorState.looksBinary) {
+    const ok = confirm(
+      "This file appears to be binary. Saving the text shown will " +
+        "permanently overwrite the original bytes and likely corrupt it.\n\n" +
+        "Continue anyway?",
+    );
+    if (!ok) return;
+  }
+
+  els.editorSave.disabled = true;
+  const prevLabel = els.editorSave.textContent;
+  els.editorSave.textContent = "Saving…";
+  try {
+    const csrf = getCsrfToken();
+    const headers = { "content-type": "application/octet-stream" };
+    if (csrf) headers["x-csrf-token"] = csrf;
+    const res = await fetch(
+      `/api/file?path=${encodeURIComponent(editorState.path)}`,
+      {
+        method: "PUT",
+        credentials: "same-origin",
+        headers,
+        body: text,
+      },
+    );
+    if (res.status === 401) {
+      redirectToLogin();
+      return;
+    }
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const b = await res.json();
+        if (b && b.error) msg = b.error;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(msg);
+    }
+    editorState.originalText = text;
+    els.editorDirty.hidden = true;
+    // If the file lives in the folder we're currently viewing, refresh the
+    // listing so size / mtime update.
+    const parent = editorState.path.includes("/")
+      ? editorState.path.slice(0, editorState.path.lastIndexOf("/"))
+      : "";
+    closeEditor(true);
+    if (parent === state.path) loadPath(state.path);
+  } catch (err) {
+    alert(`Save failed: ${err.message}`);
+  } finally {
+    els.editorSave.textContent = prevLabel;
+    // disabled state will get refreshed by next change event or close()
+    if (editorState.cm) {
+      els.editorSave.disabled =
+        editorState.cm.getValue() === editorState.originalText;
+    }
+  }
+}
+
+function closeEditor(force) {
+  if (!editorState.path) return;
+  const dirty =
+    editorState.cm &&
+    editorState.cm.getValue() !== editorState.originalText;
+  if (dirty && !force) {
+    if (!confirm("Discard unsaved changes?")) return;
+  }
+  els.editorModal.hidden = true;
+  document.body.classList.remove("editor-open");
+  // Drop the CodeMirror DOM so it doesn't hold onto the document /
+  // event listeners while the editor is closed.
+  els.editorBody.replaceChildren();
+  editorState.path = null;
+  editorState.originalText = null;
+  editorState.cm = null;
+  editorState.looksBinary = false;
+  els.editorDirty.hidden = true;
+  els.editorWarning.hidden = true;
+}
+
+els.editorSave.addEventListener("click", () => saveEditor());
+els.editorCancel.addEventListener("click", () => closeEditor(false));
+// Clicking the dim backdrop closes (with the usual unsaved-changes prompt).
+els.editorModal.addEventListener("click", (ev) => {
+  if (ev.target === els.editorModal) closeEditor(false);
+});
+// Modal-scoped key handling. CodeMirror's extraKeys already covers Esc /
+// Cmd-S while its textarea is focused; this catches the case where focus is
+// on the Save / Cancel buttons (or the warning banner).
+els.editorModal.addEventListener("keydown", (ev) => {
+  if (!editorState.path) return;
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closeEditor(false);
+  } else if ((ev.metaKey || ev.ctrlKey) && (ev.key === "s" || ev.key === "S")) {
+    ev.preventDefault();
+    saveEditor();
+  }
+});
 
 /* -------------------------------------------------------------------------- */
 /*  Boot                                                                      */

@@ -15,7 +15,8 @@
     "docker:refresh": "docker compose build && docker compose up -d && docker compose logs -f"
   },
   "dependencies": {
-    "archiver": "^7.0.1"
+    "archiver": "^7.0.1",
+    "codemirror": "^5.65.21"
   },
   "devDependencies": {
     "@types/archiver": "^6.0.2",

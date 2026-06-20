@@ -1,4 +1,4 @@
-import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
+import { randomBytes, createHmac, createPublicKey, createVerify, timingSafeEqual, type KeyObject } from "node:crypto";
 
 /* -------------------------------------------------------------------------- */
 /*  Config                                                                    */
@@ -270,6 +270,8 @@ export function verifyCsrf(cookieVal: string | undefined, headerVal: string | nu
 
 export interface OAuthStatePayload {
   n: string;
+  /** Nonce echoed back in the id_token; binds this state to its token. */
+  c: string;
   r: string;
   exp: number;
 }
@@ -277,9 +279,11 @@ export interface OAuthStatePayload {
 export function buildOAuthState(
   config: AuthConfig,
   returnTo: string | undefined,
-): { state: string; cookie: string } {
+): { state: string; nonce: string; cookie: string } {
+  const nonce = randomBytes(16).toString("base64url");
   const payload: OAuthStatePayload = {
     n: randomBytes(16).toString("base64url"),
+    c: nonce,
     r: sanitizeReturnTo(returnTo),
     exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS,
   };
@@ -290,14 +294,14 @@ export function buildOAuthState(
     secure: config.cookieSecure,
     sameSite: "Lax",
   });
-  return { state, cookie };
+  return { state, nonce, cookie };
 }
 
 export function consumeOAuthState(
   stateParam: string | null,
   cookieValue: string | undefined,
   config: AuthConfig,
-): { returnTo: string } | null {
+): { returnTo: string; nonce: string } | null {
   if (!stateParam || !cookieValue) return null;
   const a = Buffer.from(stateParam);
   const b = Buffer.from(cookieValue);
@@ -306,7 +310,8 @@ export function consumeOAuthState(
   }
   const payload = verifyToken<OAuthStatePayload>(stateParam, config.sessionSecret);
   if (!payload) return null;
-  return { returnTo: sanitizeReturnTo(payload.r) };
+  if (typeof payload.c !== "string" || payload.c.length === 0) return null;
+  return { returnTo: sanitizeReturnTo(payload.r), nonce: payload.c };
 }
 
 /**
@@ -343,6 +348,10 @@ export function isEmailAllowed(email: string, config: AuthConfig): boolean {
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
+
+/** Allowable id_token signing algorithms — Google uses RS256. */
+const ALLOWED_ID_TOKEN_ALGS = new Set(["RS256"]);
 
 export class AuthError extends Error {
   status: number;
@@ -356,13 +365,14 @@ export function redirectUri(config: AuthConfig): string {
   return `${config.publicUrl}/auth/callback`;
 }
 
-export function buildAuthorizeUrl(state: string, config: AuthConfig): string {
+export function buildAuthorizeUrl(state: string, nonce: string, config: AuthConfig): string {
   const params = new URLSearchParams({
     client_id: config.clientId,
     redirect_uri: redirectUri(config),
     response_type: "code",
     scope: "openid email profile",
     state,
+    nonce,
     access_type: "online",
     include_granted_scopes: "true",
     prompt: "select_account",
@@ -372,6 +382,7 @@ export function buildAuthorizeUrl(state: string, config: AuthConfig): string {
 
 export async function exchangeCodeForEmail(
   code: string,
+  expectedNonce: string,
   config: AuthConfig,
 ): Promise<{ email: string }> {
   const body = new URLSearchParams({
@@ -414,22 +425,185 @@ export async function exchangeCodeForEmail(
   if (typeof idToken !== "string") {
     throw new AuthError("Missing id_token in response", 502);
   }
-  return validateIdToken(idToken, config);
+  return await validateIdToken(idToken, expectedNonce, config);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  JWKS cache                                                                */
+/* -------------------------------------------------------------------------- */
+
+interface CachedKey {
+  key: KeyObject;
+  alg: string;
+}
+
+interface JwksCache {
+  /** kid → key */
+  keys: Map<string, CachedKey>;
+  expiresAt: number;
+  inflight: Promise<void> | null;
+}
+
+const jwksCache: JwksCache = { keys: new Map(), expiresAt: 0, inflight: null };
+
+/** Default JWKS TTL when the response has no usable Cache-Control. */
+const JWKS_DEFAULT_TTL_MS = 60 * 60 * 1000; // 1 hour
+const JWKS_MIN_TTL_MS = 5 * 60 * 1000;       // never refresh more than once per 5 min
+const JWKS_MAX_TTL_MS = 24 * 60 * 60 * 1000; // cap at 24h
+
+interface JwkRsa {
+  kty?: string;
+  kid?: string;
+  alg?: string;
+  use?: string;
+  n?: string;
+  e?: string;
+}
+
+async function fetchJwks(): Promise<void> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10_000);
+  let res: Response;
+  try {
+    res = await fetch(GOOGLE_JWKS_URL, { signal: ctrl.signal });
+  } catch {
+    throw new AuthError("JWKS endpoint unreachable", 502);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res.ok) {
+    throw new AuthError("JWKS fetch failed", 502);
+  }
+  let body: { keys?: unknown };
+  try {
+    body = (await res.json()) as { keys?: unknown };
+  } catch {
+    throw new AuthError("Malformed JWKS response", 502);
+  }
+  if (!Array.isArray(body.keys)) {
+    throw new AuthError("Malformed JWKS response", 502);
+  }
+
+  const next = new Map<string, CachedKey>();
+  for (const raw of body.keys) {
+    const jwk = raw as JwkRsa;
+    if (jwk.kty !== "RSA") continue;
+    if (typeof jwk.kid !== "string" || jwk.kid.length === 0) continue;
+    if (typeof jwk.n !== "string" || typeof jwk.e !== "string") continue;
+    const alg = typeof jwk.alg === "string" ? jwk.alg : "RS256";
+    if (!ALLOWED_ID_TOKEN_ALGS.has(alg)) continue;
+    try {
+      const key = createPublicKey({
+        key: { kty: "RSA", n: jwk.n, e: jwk.e } as never,
+        format: "jwk",
+      });
+      next.set(jwk.kid, { key, alg });
+    } catch {
+      // Skip malformed entries silently — we still want any healthy keys.
+      continue;
+    }
+  }
+  if (next.size === 0) {
+    throw new AuthError("JWKS contained no usable RSA keys", 502);
+  }
+
+  // Honour Cache-Control max-age when present, clamped to sensible bounds.
+  let ttlMs = JWKS_DEFAULT_TTL_MS;
+  const cc = res.headers.get("cache-control");
+  if (cc) {
+    const m = /max-age\s*=\s*(\d+)/i.exec(cc);
+    if (m) {
+      const secs = Number(m[1]);
+      if (Number.isFinite(secs) && secs > 0) ttlMs = secs * 1000;
+    }
+  }
+  ttlMs = Math.min(JWKS_MAX_TTL_MS, Math.max(JWKS_MIN_TTL_MS, ttlMs));
+  jwksCache.keys = next;
+  jwksCache.expiresAt = Date.now() + ttlMs;
+}
+
+async function ensureJwks(force = false): Promise<void> {
+  if (!force && jwksCache.keys.size > 0 && Date.now() < jwksCache.expiresAt) return;
+  if (jwksCache.inflight) {
+    await jwksCache.inflight;
+    return;
+  }
+  const p = fetchJwks().finally(() => {
+    jwksCache.inflight = null;
+  });
+  jwksCache.inflight = p;
+  await p;
+}
+
+async function getKey(kid: string): Promise<CachedKey> {
+  await ensureJwks();
+  let entry = jwksCache.keys.get(kid);
+  if (!entry) {
+    // Key rotated? Force one refresh before giving up.
+    await ensureJwks(true);
+    entry = jwksCache.keys.get(kid);
+  }
+  if (!entry) throw new AuthError("Unknown id_token signing key", 401);
+  return entry;
 }
 
 /**
- * Parse and validate the id_token claims. Per Google's docs, when the token
- * is obtained directly from the token endpoint over TLS, signature
- * verification can be skipped — but we still validate the claims defensively.
- * See: https://developers.google.com/identity/openid-connect/openid-connect#validatinganidtoken
+ * Validate the id_token: verify the RS256 signature against Google's JWKS,
+ * then check every claim that matters (iss, aud, exp, iat, nonce, email,
+ * email_verified). Skipping signature verification — even when fetched
+ * directly from the token endpoint — leaves a defence-in-depth gap; the
+ * cost of doing it is one cached HTTPS GET to Google's certs endpoint.
  */
-function validateIdToken(idToken: string, config: AuthConfig): { email: string } {
+async function validateIdToken(
+  idToken: string,
+  expectedNonce: string,
+  config: AuthConfig,
+): Promise<{ email: string }> {
+  // Cap input length to keep b64 decoding bounded.
+  if (idToken.length > 16 * 1024) {
+    throw new AuthError("id_token too large", 401);
+  }
   const parts = idToken.split(".");
   if (parts.length !== 3) throw new AuthError("Malformed id_token", 502);
+  const [rawHeader, rawPayload, rawSig] = parts as [string, string, string];
+
+  let header: Record<string, unknown>;
+  try {
+    header = JSON.parse(b64urlDecode(rawHeader).toString("utf8")) as Record<string, unknown>;
+  } catch {
+    throw new AuthError("Malformed id_token header", 502);
+  }
+  const alg = header.alg;
+  const kid = header.kid;
+  if (typeof alg !== "string" || !ALLOWED_ID_TOKEN_ALGS.has(alg)) {
+    throw new AuthError("Unsupported id_token algorithm", 401);
+  }
+  if (typeof kid !== "string" || kid.length === 0) {
+    throw new AuthError("Missing id_token key id", 401);
+  }
+
+  const { key, alg: keyAlg } = await getKey(kid);
+  if (keyAlg !== alg) {
+    throw new AuthError("id_token alg/key mismatch", 401);
+  }
+
+  let signature: Buffer;
+  try {
+    signature = b64urlDecode(rawSig);
+  } catch {
+    throw new AuthError("Malformed id_token signature", 502);
+  }
+  const signedInput = Buffer.from(`${rawHeader}.${rawPayload}`, "utf8");
+  const verifier = createVerify("RSA-SHA256");
+  verifier.update(signedInput);
+  verifier.end();
+  if (!verifier.verify(key, signature)) {
+    throw new AuthError("id_token signature verification failed", 401);
+  }
 
   let payload: Record<string, unknown>;
   try {
-    payload = JSON.parse(b64urlDecode(parts[1] as string).toString("utf8")) as Record<string, unknown>;
+    payload = JSON.parse(b64urlDecode(rawPayload).toString("utf8")) as Record<string, unknown>;
   } catch {
     throw new AuthError("Malformed id_token payload", 502);
   }
@@ -449,6 +623,17 @@ function validateIdToken(idToken: string, config: AuthConfig): { email: string }
   const iat = payload.iat;
   if (typeof iat === "number" && iat > now + 60) {
     throw new AuthError("id_token issued in the future", 401);
+  }
+  // Bind this id_token to the OAuth state we just consumed. constant-time
+  // compare so the nonce isn't used as an oracle for state-leak attacks.
+  const nonce = payload.nonce;
+  if (typeof nonce !== "string" || nonce.length === 0) {
+    throw new AuthError("id_token missing nonce", 401);
+  }
+  const a = Buffer.from(nonce);
+  const b = Buffer.from(expectedNonce);
+  if (a.length === 0 || a.length !== b.length || !timingSafeEqual(a, b)) {
+    throw new AuthError("id_token nonce mismatch", 401);
   }
   const email = payload.email;
   if (typeof email !== "string" || email.length === 0) {

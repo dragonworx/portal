@@ -1,6 +1,7 @@
-import { stat, readdir, mkdir, rm, rename, cp } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { stat, readdir, mkdir, rm, rename, cp, writeFile } from "node:fs/promises";
+import { createWriteStream, constants as fsConstants, openSync } from "node:fs";
 import { Readable } from "node:stream";
+import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import archiver from "archiver";
 
@@ -46,6 +47,10 @@ if (authConfig.enabled) {
 }
 
 const CLIENT_DIR = new URL("../public/", import.meta.url).pathname;
+/** Vendored third-party assets — currently just the CodeMirror 5 editor that
+ *  powers the in-browser file editor. We serve a tight whitelist of files
+ *  out of node_modules instead of bundling/copying them. */
+const CODEMIRROR_DIR = new URL("../node_modules/codemirror/", import.meta.url).pathname;
 
 /** Hard cap for small JSON request bodies (/api/zip, /api/mkdir). */
 const JSON_BODY_LIMIT = 1 * 1024 * 1024; // 1 MB
@@ -86,9 +91,13 @@ function errorResponse(err: unknown): Response {
   if (err instanceof PathError) {
     return json({ error: err.message }, { status: err.status });
   }
-  console.error("[portal] error:", err);
-  const message = err instanceof Error ? err.message : "Internal error";
-  return json({ error: message }, { status: 500 });
+  // Don't leak raw error.message to the client: Node fs errors include
+  // absolute paths and other internal detail. Log it server-side and return
+  // an opaque envelope with a short correlation id so operators can find it
+  // in the logs without us shipping the underlying string to the caller.
+  const ref = randomBytes(6).toString("base64url");
+  console.error(`[portal] error ref=${ref}:`, err);
+  return json({ error: "Internal error", ref }, { status: 500 });
 }
 
 function redirect(location: string, init: ResponseInit = {}): Response {
@@ -115,6 +124,9 @@ function withSecurityHeaders(res: Response, isHtml = false): Response {
         "default-src 'self'",
         "script-src 'self'",
         "style-src 'self'",
+        // CodeMirror sets inline `style` attributes (cursor / gutter sizing)
+        // — allow inline style attrs while still blocking inline <style>.
+        "style-src-attr 'unsafe-inline'",
         "img-src 'self' data:",
         "font-src 'self'",
         "connect-src 'self'",
@@ -151,13 +163,12 @@ function invalidBaseName(name: string): string | null {
 }
 
 async function readJsonLimited(req: Request, limit: number): Promise<unknown> {
-  const contentLength = Number(req.headers.get("content-length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > limit) {
-    throw new PathError("body too large", 413);
-  }
-  const text = await req.text();
-  if (text.length > limit) {
-    throw new PathError("body too large", 413);
+  const buf = await readBodyLimited(req, limit);
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    throw new PathError("invalid JSON", 400);
   }
   try {
     return JSON.parse(text);
@@ -165,6 +176,156 @@ async function readJsonLimited(req: Request, limit: number): Promise<unknown> {
     throw new PathError("invalid JSON", 400);
   }
 }
+
+/**
+ * Stream-read a request body and refuse anything larger than `limit`.
+ * Crucially this never trusts Content-Length: a missing or lying header
+ * cannot trick us into buffering more than `limit` bytes (the global
+ * `maxRequestBodySize` is sized for large uploads, so the cheap JSON
+ * endpoints have to enforce their own ceiling).
+ */
+async function readBodyLimited(req: Request, limit: number): Promise<Uint8Array> {
+  const declared = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > limit) {
+    throw new PathError("body too large", 413);
+  }
+  if (!req.body) return new Uint8Array(0);
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      received += value.byteLength;
+      if (received > limit) {
+        try {
+          await reader.cancel();
+        } catch {
+          /* ignore */
+        }
+        throw new PathError("body too large", 413);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* ignore */
+    }
+  }
+  if (chunks.length === 1) return chunks[0] as Uint8Array;
+  const out = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  CSRF token issuance for anonymous + authenticated sessions                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Ensure the caller has a CSRF cookie. Returns the existing token if one is
+ * present, otherwise mints a fresh one and includes a Set-Cookie header so
+ * the next state-changing request from the same client can echo it. This
+ * runs whether auth is enabled or not: CSRF protection should not depend on
+ * the operator having flipped a config flag.
+ */
+function ensureCsrfCookie(
+  cookies: Record<string, string>,
+): { token: string; setCookie: string | null } {
+  const existing = cookies[CSRF_COOKIE];
+  if (existing && existing.length >= 16 && existing.length <= 128) {
+    return { token: existing, setCookie: null };
+  }
+  const token = randomBytes(32).toString("base64url");
+  const setCookie = buildCookie(CSRF_COOKIE, token, {
+    // Long lifetime — the cookie is just an anti-CSRF nonce, not a credential.
+    maxAge: 7 * 24 * 3600,
+    httpOnly: false,
+    secure: authConfig.cookieSecure,
+    sameSite: "Lax",
+  });
+  return { token, setCookie };
+}
+
+function appendSetCookie(res: Response, cookie: string | null): Response {
+  if (!cookie) return res;
+  res.headers.append("set-cookie", cookie);
+  return res;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Per-IP rate limiting                                                      */
+/* -------------------------------------------------------------------------- */
+
+interface Bucket {
+  tokens: number;
+  lastRefill: number;
+}
+
+/** Hard cap on tracked buckets so an attacker can't grow the map unbounded
+ *  by rotating source IPs. When we hit the cap we drop the oldest entries. */
+const RATE_LIMIT_MAX_BUCKETS = 10_000;
+
+const apiBuckets = new Map<string, Bucket>();
+const authBuckets = new Map<string, Bucket>();
+
+/**
+ * Token bucket. `capacity` is the burst size; `refillPerSec` is the
+ * steady-state rate. Returns true if the request is allowed.
+ */
+function consumeToken(
+  map: Map<string, Bucket>,
+  key: string,
+  capacity: number,
+  refillPerSec: number,
+): boolean {
+  const now = Date.now();
+  let b = map.get(key);
+  if (!b) {
+    if (map.size >= RATE_LIMIT_MAX_BUCKETS) {
+      // Drop the oldest entry (insertion-ordered Map iteration).
+      const firstKey = map.keys().next().value;
+      if (firstKey !== undefined) map.delete(firstKey);
+    }
+    b = { tokens: capacity, lastRefill: now };
+    map.set(key, b);
+  }
+  const elapsed = (now - b.lastRefill) / 1000;
+  if (elapsed > 0) {
+    b.tokens = Math.min(capacity, b.tokens + elapsed * refillPerSec);
+    b.lastRefill = now;
+  }
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+function rateLimitResponse(): Response {
+  return json({ error: "rate limited" }, {
+    status: 429,
+    headers: { "retry-after": "30" },
+  });
+}
+
+/** Periodically drop idle buckets so the maps don't grow over time. */
+const RATE_LIMIT_GC_INTERVAL_MS = 5 * 60 * 1000;
+const RATE_LIMIT_IDLE_MS = 30 * 60 * 1000;
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_IDLE_MS;
+  for (const map of [apiBuckets, authBuckets]) {
+    for (const [k, v] of map) {
+      if (v.lastRefill < cutoff) map.delete(k);
+    }
+  }
+}, RATE_LIMIT_GC_INTERVAL_MS).unref?.();
 
 /* -------------------------------------------------------------------------- */
 /*  File-API handlers                                                         */
@@ -323,27 +484,75 @@ async function handleUpload(req: Request, url: URL): Promise<Response> {
   }
 
   // Stream the request body to disk so we never buffer the whole file.
-  const sink = createWriteStream(dest);
+  // O_NOFOLLOW: if the destination already exists as a symlink (placed in
+  // /data out-of-band) the open(2) call will fail with ELOOP rather than
+  // silently writing through the link to its target. We open the fd
+  // ourselves (rather than letting createWriteStream do it) so we can pass
+  // a numeric flags mask — the StreamOptions.flags type only accepts
+  // strings, which can't express O_NOFOLLOW.
+  let fd: number;
+  try {
+    fd = openSync(
+      dest,
+      fsConstants.O_WRONLY |
+        fsConstants.O_CREAT |
+        fsConstants.O_TRUNC |
+        fsConstants.O_NOFOLLOW,
+      0o644,
+    );
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") {
+      throw new PathError("Destination is a symlink", 400);
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      throw new PathError("Permission denied", 403);
+    }
+    if (code === "EISDIR") {
+      throw new PathError("Destination is a directory", 400);
+    }
+    throw err;
+  }
+  const sink = createWriteStream("", { fd, autoClose: true });
+  // Surface stream-open errors (ELOOP from O_NOFOLLOW, EACCES, etc.) as a
+  // proper PathError instead of letting them bubble up as unhandled
+  // 'error' events on the WriteStream.
+  const sinkErrored: Promise<never> = new Promise((_, rej) => {
+    sink.once("error", (err) => rej(err));
+  });
   const reader = req.body.getReader();
   let received = 0;
   try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      received += value.byteLength;
-      if (received > config.maxUploadBytes) {
-        sink.destroy();
-        return json({ error: "file too large" }, { status: 413 });
-      }
-      if (!sink.write(value)) {
-        await new Promise<void>((res) => sink.once("drain", () => res()));
-      }
-    }
-    await new Promise<void>((res, rej) => {
-      sink.end((err?: Error | null) => (err ? rej(err) : res()));
-    });
+    await Promise.race([
+      sinkErrored,
+      (async () => {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          received += value.byteLength;
+          if (received > config.maxUploadBytes) {
+            sink.destroy();
+            throw new PathError("file too large", 413);
+          }
+          if (!sink.write(value)) {
+            await new Promise<void>((res) => sink.once("drain", () => res()));
+          }
+        }
+        await new Promise<void>((res, rej) => {
+          sink.end((err?: Error | null) => (err ? rej(err) : res()));
+        });
+      })(),
+    ]);
   } catch (err) {
     sink.destroy();
+    if (err instanceof PathError) throw err;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") {
+      throw new PathError("Destination is a symlink", 400);
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      throw new PathError("Permission denied", 403);
+    }
     throw err;
   }
 
@@ -370,6 +579,51 @@ async function handleMkdir(req: Request): Promise<Response> {
   );
   await mkdir(target, { recursive: false });
   return json({ ok: true });
+}
+
+/**
+ * POST /api/touch
+ * Body: { path, name }
+ * Creates a new empty file in `path` named `name`. Refuses to clobber an
+ * existing entry (`flag: "wx"`) so we don't silently truncate the user's
+ * data when they typo a name.
+ */
+async function handleTouch(req: Request): Promise<Response> {
+  const body = (await readJsonLimited(req, JSON_BODY_LIMIT)) as {
+    path?: unknown;
+    name?: unknown;
+  };
+  if (typeof body.path !== "string" || typeof body.name !== "string") {
+    return json({ error: "path and name required" }, { status: 400 });
+  }
+  const name = body.name.trim();
+  const nameErr = invalidBaseName(name);
+  if (nameErr) {
+    return json({ error: nameErr }, { status: 400 });
+  }
+  const parent = safeResolve(config.root, body.path, true);
+  const target = safeResolve(
+    config.root,
+    join(toRelative(config.root, parent), name),
+    false,
+  );
+  if (dirname(target) !== parent) {
+    return json({ error: "invalid destination" }, { status: 400 });
+  }
+  try {
+    // `wx` = O_CREAT | O_EXCL | O_WRONLY — atomic "create if not exists".
+    await writeFile(target, "", { flag: "wx" });
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") {
+      return json({ error: "name already exists" }, { status: 409 });
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      throw new PathError("Permission denied", 403);
+    }
+    throw e;
+  }
+  return json({ ok: true, name });
 }
 
 async function handleDelete(req: Request): Promise<Response> {
@@ -455,6 +709,96 @@ async function handleRename(req: Request): Promise<Response> {
 const MAX_TRANSFER_PATHS = 10_000;
 
 type ConflictPolicy = "fail" | "overwrite" | "skip";
+
+/* -------------------------------------------------------------------------- */
+/*  Inline file editor — read raw bytes, save back atomically                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * GET /api/file?path=…
+ * Returns the file's raw bytes (with `X-Portal-Size` / `X-Portal-Mtime`
+ * metadata headers so the client can detect concurrent edits if it wants).
+ * Refuses anything larger than `maxEditBytes` to keep the browser tab
+ * responsive — the user should download those instead.
+ */
+async function handleGetFile(url: URL): Promise<Response> {
+  const requested = url.searchParams.get("path") ?? "";
+  const target = safeResolve(config.root, requested, true);
+  const st = await stat(target);
+  if (st.isDirectory()) {
+    throw new PathError("Not a file", 400);
+  }
+  if (st.size > config.maxEditBytes) {
+    return json(
+      { error: "file too large to edit", size: st.size, max: config.maxEditBytes },
+      { status: 413 },
+    );
+  }
+  const file = Bun.file(target);
+  // Force octet-stream + no-store so the browser never tries to render the
+  // bytes inline (same XSS hardening as /api/download).
+  return new Response(file, {
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-length": String(st.size),
+      "cache-control": "private, no-store",
+      "x-portal-size": String(st.size),
+      "x-portal-mtime": String(Math.round(st.mtimeMs)),
+    },
+  });
+}
+
+/**
+ * PUT /api/file?path=…   body: raw file bytes
+ * Replaces the file contents atomically (temp file + rename). Refuses to
+ * create new files — uploads go through `/api/upload`.
+ */
+async function handlePutFile(req: Request, url: URL): Promise<Response> {
+  const requested = url.searchParams.get("path") ?? "";
+  const target = safeResolve(config.root, requested, true);
+  const st = await stat(target);
+  if (st.isDirectory()) {
+    throw new PathError("Not a file", 400);
+  }
+
+  // Stream-bounded read. The global maxRequestBodySize is sized for large
+  // uploads, so a 10 MB editor cap needs to be enforced per-handler — a
+  // malicious client could otherwise omit Content-Length and buffer
+  // gigabytes before we noticed.
+  const bytes = await readBodyLimited(req, config.maxEditBytes);
+
+  // Atomic replace: write to a sibling tempfile then rename(2) on top. Keeps
+  // the original intact if the write fails partway through.
+  const tmp = join(
+    dirname(target),
+    "." + basename(target) + ".tmp." + Date.now() + "." +
+      Math.random().toString(36).slice(2, 10),
+  );
+  try {
+    await Bun.write(tmp, bytes);
+    await rename(tmp, target);
+  } catch (e) {
+    // Best-effort cleanup; ignore errors from the cleanup itself.
+    try {
+      await rm(tmp, { force: true });
+    } catch {
+      /* ignore */
+    }
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") {
+      throw new PathError("Permission denied", 403);
+    }
+    if (code === "ENOSPC") {
+      throw new PathError("No space left on device", 507);
+    }
+    throw e;
+  }
+
+  const after = await stat(target);
+  return json({ ok: true, size: after.size, mtime: Math.round(after.mtimeMs) });
+}
+
+
 
 /**
  * Shared core for /api/move and /api/copy. Validates a batch of source paths
@@ -631,8 +975,8 @@ function handleAuthLogin(url: URL): Response {
     return json({ error: "auth disabled" }, { status: 404 });
   }
   const returnTo = url.searchParams.get("returnTo") ?? "/";
-  const { state, cookie } = buildOAuthState(authConfig, returnTo);
-  const target = buildAuthorizeUrl(state, authConfig);
+  const { state, nonce, cookie } = buildOAuthState(authConfig, returnTo);
+  const target = buildAuthorizeUrl(state, nonce, authConfig);
   const headers = new Headers();
   headers.append("set-cookie", cookie);
   headers.set("location", target);
@@ -660,7 +1004,7 @@ async function handleAuthCallback(
   }
 
   try {
-    const { email } = await exchangeCodeForEmail(code, authConfig);
+    const { email } = await exchangeCodeForEmail(code, consumed.nonce, authConfig);
     if (!isEmailAllowed(email, authConfig)) {
       console.warn(`[portal] denied sign-in: ${email}`);
       return loginRedirectError("Your account is not authorised for this portal.");
@@ -720,6 +1064,47 @@ async function serveStaticFile(filename: string): Promise<Response> {
   return withSecurityHeaders(res, isHtml);
 }
 
+/**
+ * Serve a whitelisted set of files out of `node_modules/codemirror/`. The
+ * editor lazy-loads modes from `/vendor/codemirror/mode/<x>/<x>.js`, so we
+ * proxy to the installed package rather than copying files into /public.
+ *
+ * Only `.js` and `.css` under lib/, mode/, addon/, theme/, or keymap/ are
+ * served — anything else returns 404 so we can't be tricked into exposing
+ * package metadata or source maps.
+ */
+async function serveCodemirrorFile(rel: string): Promise<Response> {
+  if (
+    rel.includes("..") ||
+    rel.includes("\0") ||
+    rel.startsWith("/") ||
+    !/^(lib|mode|addon|theme|keymap)\//.test(rel) ||
+    !/\.(js|css)$/.test(rel)
+  ) {
+    return new Response("Not found", { status: 404 });
+  }
+  const abs = join(CODEMIRROR_DIR, rel);
+  if (!abs.startsWith(CODEMIRROR_DIR)) {
+    return new Response("Not found", { status: 404 });
+  }
+  const file = Bun.file(abs);
+  if (!(await file.exists())) {
+    return new Response("Not found", { status: 404 });
+  }
+  const isCss = rel.endsWith(".css");
+  const res = new Response(file, {
+    headers: {
+      "content-type": isCss
+        ? "text/css; charset=utf-8"
+        : "application/javascript; charset=utf-8",
+      // Vendor assets are immutable per package version — let the browser
+      // cache them aggressively to keep editor open snappy.
+      "cache-control": "public, max-age=86400",
+    },
+  });
+  return withSecurityHeaders(res);
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Server                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -733,15 +1118,59 @@ function resolveSession(cookies: Record<string, string>, auth: AuthConfig): Sess
   return verifySession(cookies[SESSION_COOKIE], auth);
 }
 
+/**
+ * Defence-in-depth same-origin gate. Browsers reliably send
+ * `Sec-Fetch-Site` on every cross-origin fetch from a real page — when it
+ * isn't `same-origin`/`same-site`/`none` we refuse. Combined with the
+ * double-submit CSRF token this makes cross-origin POSTs require an
+ * attacker who can both forge `Sec-Fetch-Site` *and* read our cookies.
+ */
+function isCrossSiteRequest(req: Request): boolean {
+  const sfs = req.headers.get("sec-fetch-site");
+  if (sfs) {
+    // `none` = top-level user-initiated navigation (address bar / bookmark).
+    return sfs !== "same-origin" && sfs !== "same-site" && sfs !== "none";
+  }
+  return false;
+}
+
+/** Endpoints whose method is state-changing and that must pass CSRF/origin checks. */
+function isStateChanging(method: string): boolean {
+  return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+}
+
 Bun.serve({
   port: config.port,
   hostname: config.host,
-  // Allow uploads up to the configured size cap.
+  // Allow uploads up to the configured size cap. Other routes enforce
+  // their own (much smaller) per-handler limits via readBodyLimited /
+  // readJsonLimited so a missing Content-Length can't be used to balloon
+  // memory on JSON endpoints.
   maxRequestBodySize: config.maxUploadBytes,
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url);
     const cookies = parseCookies(req.headers.get("cookie"));
+    const remote = server.requestIP(req);
+    const ip = remote?.address ?? "unknown";
+
     try {
+      // --- Rate limiting (applied before any expensive work) ------------------
+      // Tight bucket on auth endpoints — these are the highest-value targets
+      // for brute-force / OAuth-state grinding.
+      if (url.pathname.startsWith("/auth/") || url.pathname === "/login") {
+        if (!consumeToken(authBuckets, ip, 10, 0.5)) {
+          return withSecurityHeaders(rateLimitResponse());
+        }
+      }
+      // Broader bucket on the API surface — generous enough not to bother
+      // legitimate clients (the UI does dozens of requests per minute) but
+      // closes the door on naive abuse.
+      if (url.pathname.startsWith("/api/") && url.pathname !== "/api/ping") {
+        if (!consumeToken(apiBuckets, ip, 120, 20)) {
+          return withSecurityHeaders(rateLimitResponse());
+        }
+      }
+
       // --- Public endpoints ---------------------------------------------------
       if (url.pathname === "/auth/login" && req.method === "GET") {
         return withSecurityHeaders(handleAuthLogin(url));
@@ -764,7 +1193,8 @@ Bun.serve({
       // /login (and /login.html) — public, but bounce already-signed-in users home.
       if (url.pathname === "/login" || url.pathname === "/login.html") {
         if (session) return withSecurityHeaders(redirect("/"));
-        return await serveStaticFile("login.html");
+        const csrf = ensureCsrfCookie(cookies);
+        return appendSetCookie(await serveStaticFile("login.html"), csrf.setCookie);
       }
 
       // --- Authentication gate ------------------------------------------------
@@ -781,13 +1211,14 @@ Bun.serve({
         );
       }
 
-      // --- CSRF gate for state-changing API requests --------------------------
-      if (
-        authConfig.enabled &&
-        url.pathname.startsWith("/api/") &&
-        req.method !== "GET" &&
-        req.method !== "HEAD"
-      ) {
+      // --- CSRF + same-origin gate for state-changing API requests ------------
+      // Enforced unconditionally (i.e. even when auth is disabled) — otherwise
+      // a malicious page in another tab could drive the API of an unauth'd
+      // deployment via the user's browser.
+      if (url.pathname.startsWith("/api/") && isStateChanging(req.method)) {
+        if (isCrossSiteRequest(req)) {
+          return withSecurityHeaders(json({ error: "cross-site" }, { status: 403 }));
+        }
         if (!verifyCsrf(cookies[CSRF_COOKIE], req.headers.get("x-csrf-token"))) {
           return withSecurityHeaders(json({ error: "csrf" }, { status: 403 }));
         }
@@ -795,12 +1226,14 @@ Bun.serve({
 
       // --- API routes ---------------------------------------------------------
       if (url.pathname === "/api/me" && req.method === "GET") {
-        return withSecurityHeaders(
-          json({
-            email: session ? session.email : null,
-            authEnabled: authConfig.enabled,
-          }),
-        );
+        // /api/me is called on every page load — convenient point to mint a
+        // CSRF cookie for anonymous (auth-disabled) sessions.
+        const csrf = ensureCsrfCookie(cookies);
+        const res = json({
+          email: session ? session.email : null,
+          authEnabled: authConfig.enabled,
+        });
+        return withSecurityHeaders(appendSetCookie(res, csrf.setCookie));
       }
       if (url.pathname === "/api/list" && req.method === "GET") {
         return withSecurityHeaders(await handleList(url));
@@ -817,11 +1250,20 @@ Bun.serve({
       if (url.pathname === "/api/mkdir" && req.method === "POST") {
         return withSecurityHeaders(await handleMkdir(req));
       }
+      if (url.pathname === "/api/touch" && req.method === "POST") {
+        return withSecurityHeaders(await handleTouch(req));
+      }
       if (url.pathname === "/api/delete" && req.method === "POST") {
         return withSecurityHeaders(await handleDelete(req));
       }
       if (url.pathname === "/api/rename" && req.method === "POST") {
         return withSecurityHeaders(await handleRename(req));
+      }
+      if (url.pathname === "/api/file" && req.method === "GET") {
+        return withSecurityHeaders(await handleGetFile(url));
+      }
+      if (url.pathname === "/api/file" && req.method === "PUT") {
+        return withSecurityHeaders(await handlePutFile(req, url));
       }
       if (url.pathname === "/api/move" && req.method === "POST") {
         return withSecurityHeaders(await handleTransfer(req, "move"));
@@ -832,9 +1274,19 @@ Bun.serve({
 
       // --- Static client ------------------------------------------------------
       if (req.method === "GET" || req.method === "HEAD") {
+        if (url.pathname.startsWith("/vendor/codemirror/")) {
+          return await serveCodemirrorFile(
+            url.pathname.slice("/vendor/codemirror/".length),
+          );
+        }
         const rel =
           url.pathname === "/" ? "index.html" : url.pathname.replace(/^\/+/, "");
-        return await serveStaticFile(rel);
+        const res = await serveStaticFile(rel);
+        if (rel === "index.html" || rel.endsWith(".html")) {
+          const csrf = ensureCsrfCookie(cookies);
+          return appendSetCookie(res, csrf.setCookie);
+        }
+        return res;
       }
       return new Response("Method not allowed", { status: 405 });
     } catch (err) {
