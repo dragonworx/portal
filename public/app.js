@@ -96,10 +96,6 @@ function fmtTime(ms) {
   });
 }
 
-function iconFor(entry) {
-  return entry.type === "dir" ? "▸" : "•";
-}
-
 /* -------------------------------------------------------------------------- */
 /*  Networking                                                                */
 /* -------------------------------------------------------------------------- */
@@ -289,21 +285,48 @@ function buildRow(entry, index) {
     row.classList.add("clipped");
   }
 
+  const inClipboardMode = !!state.clipboard;
   const check = document.createElement("label");
   check.className = "cell cell-check";
-  const cb = document.createElement("input");
-  cb.type = "checkbox";
-  cb.checked = state.selected.has(entry.name);
-  cb.addEventListener("click", (ev) => ev.stopPropagation());
-  cb.addEventListener("change", () => toggleSelect(entry.name, cb.checked));
-  check.appendChild(cb);
+  // selector is the <input> the row click handler must ignore (so a click on
+  // the input itself doesn't double-fire). null when there's no selector at
+  // all (files while a cut/copy is pending).
+  /** @type {HTMLInputElement|null} */
+  let selector = null;
+  if (inClipboardMode) {
+    // Clipboard mode: the listing acts as a destination picker. Only folders
+    // are selectable, and only one at a time — radio buttons enforce that.
+    // Files render no selector at all (and the row is dimmed) so it's
+    // visually obvious they aren't valid paste destinations and there's
+    // nothing for the user to click.
+    if (entry.type === "dir") {
+      selector = document.createElement("input");
+      selector.type = "radio";
+      selector.name = "paste-target";
+      selector.checked = state.selected.has(entry.name);
+      selector.addEventListener("click", (ev) => ev.stopPropagation());
+      selector.addEventListener("change", () => {
+        state.selected.clear();
+        if (selector.checked) state.selected.add(entry.name);
+        renderVisible();
+        renderClipboard();
+        renderSelection();
+      });
+      check.appendChild(selector);
+    } else {
+      row.classList.add("not-a-target");
+    }
+  } else {
+    selector = document.createElement("input");
+    selector.type = "checkbox";
+    selector.checked = state.selected.has(entry.name);
+    selector.addEventListener("click", (ev) => ev.stopPropagation());
+    selector.addEventListener("change", () => toggleSelect(entry.name, selector.checked));
+    check.appendChild(selector);
+  }
 
   const name = document.createElement("div");
   name.className = "cell cell-name";
-  const icon = document.createElement("span");
-  icon.className = "icon";
-  icon.textContent = iconFor(entry);
-  name.append(icon);
 
   if (isEditing) {
     const input = document.createElement("input");
@@ -396,14 +419,15 @@ function buildRow(entry, index) {
 
   row.append(check, name, size, mtime, actions);
 
-  // Single click on a dir drills in; on a file it toggles selection.
+  // Single click on a dir drills in; on a file it toggles selection. While
+  // a cut/copy is pending, file rows are inert (no checkbox, no toggle).
   row.addEventListener("click", (ev) => {
-    if (ev.target === cb) return;
+    if (selector && ev.target === selector) return;
     if (isEditing) return;
     if (entry.type === "dir") {
       const next = state.path ? `${state.path}/${entry.name}` : entry.name;
       loadPath(next);
-    } else {
+    } else if (!inClipboardMode) {
       toggleSelect(entry.name, !state.selected.has(entry.name));
     }
   });
@@ -419,6 +443,13 @@ function toggleSelect(name, selected) {
 }
 
 function syncSelectAllState(list) {
+  // "Select all" makes no sense while picking a single destination folder.
+  els.selectAll.hidden = !!state.clipboard;
+  if (state.clipboard) {
+    els.selectAll.checked = false;
+    els.selectAll.indeterminate = false;
+    return;
+  }
   if (list.length === 0) {
     els.selectAll.checked = false;
     els.selectAll.indeterminate = false;
@@ -430,6 +461,18 @@ function syncSelectAllState(list) {
 }
 
 function renderSelection() {
+  if (state.clipboard) {
+    // In clipboard mode the selection represents the paste destination, not
+    // a set of source items, so cut/copy/download don't apply.
+    els.btnDownload.disabled = true;
+    els.btnCut.disabled = true;
+    els.btnCopy.disabled = true;
+    const target = currentPasteTargetName();
+    els.selSummary.textContent = target
+      ? `Target: ${target}/`
+      : "Pick a destination folder";
+    return;
+  }
   const n = state.selected.size;
   els.btnDownload.disabled = n === 0;
   els.btnCut.disabled = n === 0;
@@ -446,6 +489,22 @@ function renderSelection() {
     if (dirs) parts.push(`${dirs} folder${dirs === 1 ? "" : "s"}`);
     els.selSummary.textContent = `${parts.join(", ")} • ${fmtSize(totalBytes)}${dirs ? "+" : ""}`;
   }
+}
+
+// Returns the name of the currently-selected destination folder in the
+// listing (single radio pick), or null when no folder is targeted — paste
+// then falls back to the current folder.
+function currentPasteTargetName() {
+  if (state.selected.size !== 1) return null;
+  const name = state.selected.values().next().value;
+  const entry = state.entries.find((e) => e.name === name);
+  return entry && entry.type === "dir" ? name : null;
+}
+
+function currentPasteTargetPath() {
+  const name = currentPasteTargetName();
+  if (!name) return state.path;
+  return state.path ? `${state.path}/${name}` : name;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -490,6 +549,16 @@ async function commitRename(entry) {
       state.entries[idx] = { ...state.entries[idx], name: newName };
       if (state.selected.delete(original)) state.selected.add(newName);
     }
+    // Keep a pending cut/copy in sync — otherwise paste would send the old
+    // name and the server would 404, silently dropping that entry from the
+    // batch.
+    if (state.clipboard && state.clipboard.sourcePath === state.path) {
+      const ci = state.clipboard.names.indexOf(original);
+      if (ci !== -1) {
+        state.clipboard.names[ci] = newName;
+        renderClipboard();
+      }
+    }
     renderList();
     renderSelection();
   } catch (err) {
@@ -522,13 +591,30 @@ async function deleteEntry(entry) {
     state.entries = state.entries.filter((e) => e.name !== entry.name);
     state.selected.delete(entry.name);
     if (state.editing && state.editing.name === entry.name) state.editing = null;
-    // If this entry was queued for a move/copy, drop it from the clipboard.
     if (state.clipboard) {
-      state.clipboard.names = state.clipboard.names.filter(
-        (n) =>
-          !(state.clipboard.sourcePath === state.path && n === entry.name),
-      );
-      if (state.clipboard.names.length === 0) state.clipboard = null;
+      const cbState = state.clipboard;
+      // If the deleted entry is a cut/copied item in its source folder,
+      // prune it from the pending batch.
+      if (cbState.sourcePath === state.path) {
+        cbState.names = cbState.names.filter((n) => n !== entry.name);
+      }
+      // If the deleted entry is the source folder itself (or an ancestor of
+      // it), the clipboard now points at paths that no longer exist — a
+      // subsequent paste would 404 for every item. Drop it entirely so the
+      // chip and Paste button disappear instead of silently misleading the
+      // user.
+      if (entry.type === "dir") {
+        const deletedPath = joinPath(entry.name);
+        if (
+          cbState.sourcePath === deletedPath ||
+          cbState.sourcePath.startsWith(deletedPath + "/")
+        ) {
+          state.clipboard = null;
+        }
+      }
+      if (state.clipboard && cbState.names.length === 0) {
+        state.clipboard = null;
+      }
       renderClipboard();
     }
     renderList();
@@ -551,11 +637,10 @@ function setClipboard(mode) {
     sourcePath: state.path,
     names: Array.from(state.selected),
   };
-  // For "cut" we keep the selection so the user can visually confirm what's
-  // queued; for "copy" we clear it — the originals are no longer "active".
-  if (mode === "copy") {
-    state.selected.clear();
-  }
+  // Always clear the selection on enter: the listing now repurposes it as a
+  // single-folder destination picker. Source rows from a "cut" stay visible
+  // via the .clipped class, which doesn't depend on state.selected.
+  state.selected.clear();
   renderClipboard();
   renderVisible();
   renderSelection();
@@ -572,6 +657,7 @@ function clearClipboard() {
 
 function renderClipboard() {
   const cb = state.clipboard;
+  document.body.classList.toggle("clipboard-active", !!cb);
   if (!cb) {
     els.clipboardChip.hidden = true;
     els.btnPaste.disabled = true;
@@ -585,34 +671,73 @@ function renderClipboard() {
   const n = cb.names.length;
   els.chipSummary.textContent = `${n} item${n === 1 ? "" : "s"}`;
   els.chipFrom.textContent = "/" + cb.sourcePath;
-  // Disable paste when the target is exactly the source folder of a move —
-  // it would be a no-op. (For copy we still allow it; the server reports
-  // each entry as a conflict and the user can confirm overwrite, but the
-  // common case is "no useful effect", so we disable that too.)
-  els.btnPaste.disabled = cb.sourcePath === state.path;
+  // Target = the radio-picked subfolder if any, otherwise the current folder.
+  // Disable paste when the target is exactly the source folder — that would
+  // be a no-op (for copy the server would treat each name as a conflict).
+  const targetPath = currentPasteTargetPath();
+  els.btnPaste.disabled = cb.sourcePath === targetPath;
   els.btnPaste.title =
-    cb.sourcePath === state.path
+    cb.sourcePath === targetPath
       ? "Already in this folder"
-      : `Paste into /${state.path} (⌘/Ctrl+V)`;
+      : `Paste into /${targetPath} (⌘/Ctrl+V)`;
 }
 
 async function pasteHere() {
   const cb = state.clipboard;
   if (!cb) return;
-  if (cb.sourcePath === state.path) return;
+  // Guard against a second click while the first paste is in flight — the
+  // server would race against itself (move: ENOENT on the just-moved
+  // source; copy: 409 conflicts on the freshly-written dest).
+  if (els.btnPaste.disabled) return;
+  const to = currentPasteTargetPath();
+  if (cb.sourcePath === to) return;
   const from = cb.names.map((n) =>
     cb.sourcePath ? `${cb.sourcePath}/${n}` : n,
   );
-  const result = await runTransfer(cb.mode, from, state.path, "fail");
-  if (!result) return; // user cancelled
+  const wasMove = cb.mode === "move";
+  const targetIsCurrent = to === state.path;
+  const originalHTML = els.btnPaste.innerHTML;
+  els.btnPaste.disabled = true;
+  els.btnPaste.textContent = wasMove ? "Moving…" : "Copying…";
+  let result;
+  try {
+    result = await runTransfer(cb.mode, from, to, "fail");
+  } finally {
+    els.btnPaste.innerHTML = originalHTML;
+  }
+  if (!result) {
+    // User cancelled — reset paste-button state via the normal renderer.
+    renderClipboard();
+    return;
+  }
   // On a successful move we consume the clipboard; for copy we keep it so
   // the user can paste into multiple destinations (matches OS conventions).
-  if (cb.mode === "move") {
+  if (wasMove) {
     state.clipboard = null;
     renderClipboard();
   }
   summariseTransferResult(cb.mode, result);
-  loadPath(state.path);
+  // If the user picked a subfolder as the destination, follow the files
+  // into it so they get visual confirmation that the move/copy actually
+  // landed somewhere. Without this the current view just empties out and
+  // the files appear to have vanished.
+  if (!targetIsCurrent && transferLanded(result)) {
+    loadPath(to);
+  } else {
+    loadPath(state.path);
+  }
+}
+
+// True when at least one item actually moved/copied/overwrote — i.e. the
+// transfer produced a real destination we can navigate to.
+function transferLanded(body) {
+  if (!body || !Array.isArray(body.results)) return false;
+  return body.results.some(
+    (r) =>
+      r.status === "moved" ||
+      r.status === "copied" ||
+      r.status === "overwritten",
+  );
 }
 
 async function runTransfer(mode, from, to, onConflict) {
@@ -914,12 +1039,14 @@ window.addEventListener("keydown", (ev) => {
   }
   const mod = ev.metaKey || ev.ctrlKey;
   if (mod && (ev.key === "x" || ev.key === "X")) {
-    if (state.selected.size > 0) {
+    // While a cut/copy is pending the selection means "destination folder",
+    // so re-cutting would clobber the in-flight operation.
+    if (state.selected.size > 0 && !state.clipboard) {
       ev.preventDefault();
       setClipboard("move");
     }
   } else if (mod && (ev.key === "c" || ev.key === "C")) {
-    if (state.selected.size > 0) {
+    if (state.selected.size > 0 && !state.clipboard) {
       ev.preventDefault();
       setClipboard("copy");
     }
