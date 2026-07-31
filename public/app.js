@@ -1563,6 +1563,18 @@ async function openPreview(entry) {
   } catch (err) {
     // Don't clobber the listing if the user closed the modal mid-fetch.
     if (previewState.path !== fullPath) return;
+    if (err.message && err.message.includes("too large")) {
+      // Over the server's inline-read cap — offer the download fallback.
+      els.previewMeta.textContent = "file too large to preview";
+      els.previewBody.replaceChildren(
+        previewNote(
+          "📦",
+          "This file is too large to preview in the browser.",
+          "use Download to save it locally",
+        ),
+      );
+      return;
+    }
     els.previewMeta.textContent = "error";
     els.previewBody.replaceChildren(
       previewNote("⚠", `Could not load preview: ${err.message}`),
