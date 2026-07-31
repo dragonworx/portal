@@ -11,6 +11,13 @@ services:
     container_name: portal
     restart: unless-stopped
 
+    # Under rootless Docker, container uid 0 maps to the host user who owns
+    # the daemon, so this is NOT host root — it is what makes the ./data bind
+    # mount writable and keeps new files owned by that user on the host.
+    # On rootful Docker set PORTAL_UID/PORTAL_GID in .env to your own
+    # `id -u`/`id -g` instead, or uploads land root-owned on the host.
+    user: "${PORTAL_UID:-0}:${PORTAL_GID:-0}"
+
     # Bind to loopback so the container is only reachable from the host
     # (i.e. only nginx-on-host can talk to it). Drop the `127.0.0.1:` prefix
     # if you want the container reachable directly from the network.
