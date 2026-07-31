@@ -161,6 +161,34 @@
       </div>
     </div>
 
+    <div
+      class="editor-modal preview-modal"
+      id="preview-modal"
+      hidden
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="preview-title"
+    >
+      <div class="editor-shell preview-shell">
+        <header class="editor-header">
+          <div class="editor-title-block">
+            <span class="editor-icon" id="preview-icon" aria-hidden="true">👁</span>
+            <div class="editor-title-text">
+              <strong id="preview-title" class="editor-path">file</strong>
+              <span class="editor-subtitle">
+                <span class="editor-meta" id="preview-meta">preview</span>
+              </span>
+            </div>
+          </div>
+          <div class="editor-actions">
+            <button id="preview-download" class="btn ghost" type="button">Download</button>
+            <button id="preview-close" class="btn primary" type="button">Close</button>
+          </div>
+        </header>
+        <div class="editor-body preview-body" id="preview-body"></div>
+      </div>
+    </div>
+
     <script type="module" src="/app.js"></script>
   </body>
 </html>

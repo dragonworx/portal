@@ -127,7 +127,9 @@ function withSecurityHeaders(res: Response, isHtml = false): Response {
         // CodeMirror sets inline `style` attributes (cursor / gutter sizing)
         // — allow inline style attrs while still blocking inline <style>.
         "style-src-attr 'unsafe-inline'",
-        "img-src 'self' data:",
+        // blob: is needed for image previews, which are rendered from
+        // object URLs built client-side after an authenticated fetch.
+        "img-src 'self' data: blob:",
         "font-src 'self'",
         "connect-src 'self'",
         "form-action 'self'",

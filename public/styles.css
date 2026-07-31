@@ -798,6 +798,44 @@ body.editor-open { overflow: hidden; }
 .editor-body .cm-link       { color: var(--accent); }
 .editor-body .cm-error      { color: var(--bad); }
 
+/* ---------- File preview (modal) ---------- */
+/* Lock background scroll while the preview is open. */
+body.preview-open { overflow: hidden; }
+
+.preview-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.preview-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  /* Checkerboard so transparent regions are visible. */
+  background: repeating-conic-gradient(#1b1e26 0% 25%, #12141a 0% 50%) 0 0 / 24px 24px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.preview-note {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 14px;
+  text-align: center;
+  padding: 24px;
+}
+.preview-note .preview-note-icon { font-size: 32px; }
+.preview-note code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+}
+
 /* ---------- Responsive: tablet (≤ 900px) ---------- */
 @media (max-width: 900px) {
   /* Drop the "Modified" column — least useful on small screens. */

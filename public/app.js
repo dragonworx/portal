@@ -44,6 +44,13 @@ const els = {
   editorBody: document.getElementById("editor-body"),
   editorSave: document.getElementById("editor-save"),
   editorCancel: document.getElementById("editor-cancel"),
+  // File preview (fullscreen modal).
+  previewModal: document.getElementById("preview-modal"),
+  previewTitle: document.getElementById("preview-title"),
+  previewMeta: document.getElementById("preview-meta"),
+  previewBody: document.getElementById("preview-body"),
+  previewDownload: document.getElementById("preview-download"),
+  previewClose: document.getElementById("preview-close"),
 };
 
 const ROW_HEIGHT = 40;
@@ -419,8 +426,9 @@ function buildRow(entry, index) {
 
   row.append(check, name, size, mtime, actions);
 
-  // Single click on a dir drills in; on a file it toggles selection. While
-  // a cut/copy is pending, file rows are inert (no checkbox, no toggle).
+  // Single click on a dir drills in; on a file it opens the preview. Use
+  // the checkbox to select files. While a cut/copy is pending, file rows
+  // are inert (no checkbox, no preview).
   row.addEventListener("click", (ev) => {
     if (selector && ev.target === selector) return;
     if (isEditing) return;
@@ -428,7 +436,7 @@ function buildRow(entry, index) {
       const next = state.path ? `${state.path}/${entry.name}` : entry.name;
       loadPath(next);
     } else if (!inClipboardMode) {
-      toggleSelect(entry.name, !state.selected.has(entry.name));
+      openPreview(entry);
     }
   });
 
@@ -1023,8 +1031,9 @@ window.addEventListener("keydown", (ev) => {
   // While the inline editor modal is open let it handle its own shortcuts
   // (Cmd-S, Esc, copy/paste inside CodeMirror). Otherwise selecting files
   // and then opening the editor would have Cmd-V paste them into the folder
-  // instead of into the document.
-  if (editorState.path) return;
+  // instead of into the document. Same for the preview modal — it handles
+  // its own Esc.
+  if (editorState.path || previewState.path) return;
   const t = ev.target;
   const tag = t && t.tagName;
   if (
