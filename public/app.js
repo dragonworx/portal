@@ -1503,6 +1503,221 @@ els.editorModal.addEventListener("keydown", (ev) => {
 });
 
 /* -------------------------------------------------------------------------- */
+/*  File preview                                                              */
+/*                                                                            */
+/*  Fullscreen modal shown when the user taps a file row. Images render     */
+/*  directly with format / resolution / size info; text files render in a   */
+/*  read-only CodeMirror with syntax highlighting auto-detected from the    */
+/*  filename (same lazy-loaded modes as the editor). Anything that looks    */
+/*  binary gets a fallback panel with a download button.                    */
+/* -------------------------------------------------------------------------- */
+
+/** Extensions the browser can render in an <img>. (HEIC/TIFF etc. are
+ *  excluded — most browsers can't decode them.) */
+const IMAGE_EXTS = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "avif",
+]);
+
+/** MIME types for building the preview Blob — the download endpoint serves
+ *  octet-stream, so we re-tag the bytes for correct decoding. */
+const IMAGE_MIME = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  ico: "image/x-icon",
+  svg: "image/svg+xml",
+  avif: "image/avif",
+};
+
+const previewState = {
+  /** Relative path being previewed, or null when the preview is closed. */
+  path: null,
+  /** Live read-only CodeMirror instance for text previews (null otherwise). */
+  cm: null,
+  /** Object URL backing the current <img>, revoked on close. */
+  objectUrl: null,
+};
+
+async function openPreview(entry) {
+  if (previewState.path) return; // single-instance
+  const fullPath = joinPath(entry.name);
+  previewState.path = fullPath;
+
+  els.previewTitle.textContent = "/" + fullPath;
+  els.previewTitle.title = "/" + fullPath;
+  els.previewMeta.textContent = "loading…";
+  els.previewBody.replaceChildren(previewNote("⏳", "Loading preview…"));
+  els.previewModal.hidden = false;
+  document.body.classList.add("preview-open");
+
+  const ext = extOf(entry.name);
+  try {
+    if (IMAGE_EXTS.has(ext)) {
+      await showImagePreview(fullPath, entry, ext);
+    } else {
+      await showTextPreview(fullPath, entry);
+    }
+  } catch (err) {
+    // Don't clobber the listing if the user closed the modal mid-fetch.
+    if (previewState.path !== fullPath) return;
+    els.previewMeta.textContent = "error";
+    els.previewBody.replaceChildren(
+      previewNote("⚠", `Could not load preview: ${err.message}`),
+    );
+  }
+}
+
+async function showImagePreview(fullPath, entry, ext) {
+  // Fetch with credentials (an <img src> would too, but going through api()
+  // gives us uniform 401 handling and error messages).
+  const res = await api(`/api/download?path=${encodeURIComponent(fullPath)}`);
+  const raw = await res.blob();
+  // Re-tag the octet-stream bytes with the real image type so the browser
+  // decodes them (matters for SVG, which is sniffed unreliably).
+  const typed = raw.slice(0, raw.size, IMAGE_MIME[ext] || "");
+  const objectUrl = URL.createObjectURL(typed);
+
+  const img = document.createElement("img");
+  img.className = "preview-image";
+  img.alt = entry.name;
+  const meta = await new Promise((resolve, reject) => {
+    img.addEventListener("load", () =>
+      resolve(
+        `${ext.toUpperCase()} • ${img.naturalWidth} × ${img.naturalHeight}` +
+          ` • ${fmtSize(raw.size)}`,
+      ),
+    );
+    img.addEventListener("error", () =>
+      reject(new Error("the file could not be decoded as an image")),
+    );
+    img.src = objectUrl;
+  });
+
+  if (previewState.path !== fullPath) {
+    URL.revokeObjectURL(objectUrl);
+    return;
+  }
+  previewState.objectUrl = objectUrl;
+  els.previewMeta.textContent = meta;
+  els.previewBody.replaceChildren(img);
+}
+
+async function showTextPreview(fullPath, entry) {
+  const res = await api(`/api/file?path=${encodeURIComponent(fullPath)}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+
+  // Not an image and not text — nothing sensible to render.
+  if (bytesLookBinary(bytes)) {
+    if (previewState.path !== fullPath) return;
+    els.previewMeta.textContent = `binary file • ${fmtSize(bytes.byteLength)}`;
+    els.previewBody.replaceChildren(
+      previewNote(
+        "📦",
+        "No preview available — this looks like a binary file.",
+        `${fmtSize(bytes.byteLength)} • use Download to save it locally`,
+      ),
+    );
+    return;
+  }
+
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+
+  // Detect the format from the filename and lazy-load the matching
+  // CodeMirror mode (same machinery as the inline editor).
+  await ensureCodeMirror();
+  const modeInfo = detectMode(entry.name);
+  if (modeInfo.name && modeInfo.name !== "plain" && modeInfo.name !== "null") {
+    try {
+      await ensureCodeMirrorMode(modeInfo.name);
+    } catch {
+      // Soft-fail: continue with plain text.
+    }
+  }
+
+  if (previewState.path !== fullPath) return;
+  const lines = text === "" ? 0 : text.split("\n").length;
+  els.previewMeta.textContent =
+    `${modeInfo.label || "plain text"} • ${lines} line${lines === 1 ? "" : "s"}` +
+    ` • ${fmtSize(bytes.byteLength)}`;
+
+  els.previewBody.replaceChildren();
+  const cm = window.CodeMirror(els.previewBody, {
+    value: text,
+    mode: modeInfo.mime || modeInfo.name || "null",
+    readOnly: true,
+    lineNumbers: true,
+    indentUnit: 2,
+    tabSize: 2,
+    lineWrapping: false,
+    viewportMargin: 50,
+    extraKeys: {
+      "Esc": () => { closePreview(); },
+    },
+  });
+  previewState.cm = cm;
+  cm.setSize("100%", "100%");
+  // Refresh once laid out so CodeMirror measures the viewport correctly.
+  requestAnimationFrame(() => cm.refresh());
+}
+
+function previewNote(icon, message, detail) {
+  const wrap = document.createElement("div");
+  wrap.className = "preview-note";
+  const iconEl = document.createElement("span");
+  iconEl.className = "preview-note-icon";
+  iconEl.textContent = icon;
+  const msg = document.createElement("span");
+  msg.textContent = message;
+  wrap.append(iconEl, msg);
+  if (detail) {
+    const code = document.createElement("code");
+    code.textContent = detail;
+    wrap.appendChild(code);
+  }
+  return wrap;
+}
+
+function closePreview() {
+  if (!previewState.path) return;
+  els.previewModal.hidden = true;
+  document.body.classList.remove("preview-open");
+  if (previewState.objectUrl) {
+    URL.revokeObjectURL(previewState.objectUrl);
+  }
+  // Drop the CodeMirror DOM / image so they don't hold onto resources.
+  els.previewBody.replaceChildren();
+  previewState.path = null;
+  previewState.cm = null;
+  previewState.objectUrl = null;
+}
+
+els.previewClose.addEventListener("click", closePreview);
+els.previewDownload.addEventListener("click", () => {
+  if (!previewState.path) return;
+  const name = previewState.path.split("/").pop() || "download";
+  triggerDownload(
+    `/api/download?path=${encodeURIComponent(previewState.path)}`,
+    name,
+  );
+});
+// Clicking the dim backdrop closes the preview.
+els.previewModal.addEventListener("click", (ev) => {
+  if (ev.target === els.previewModal) closePreview();
+});
+// Modal-scoped Esc handling (covers focus on the buttons; CodeMirror's
+// extraKeys covers focus inside a text preview).
+els.previewModal.addEventListener("keydown", (ev) => {
+  if (!previewState.path) return;
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    closePreview();
+  }
+});
+
+/* -------------------------------------------------------------------------- */
 /*  Boot                                                                      */
 /* -------------------------------------------------------------------------- */
 
