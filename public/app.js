@@ -886,13 +886,17 @@ function renderClipboard() {
   els.chipSummary.textContent = `${n} item${n === 1 ? "" : "s"}`;
   els.chipFrom.textContent = "/" + cb.sourcePath;
   // Target = the radio-picked subfolder if any, otherwise the current folder.
-  // Disable paste when the target is exactly the source folder — that would
-  // be a no-op (for copy the server would treat each name as a conflict).
+  // A move targeting its own source folder would be a no-op, so it stays
+  // disabled; a copy targeting its source folder is a duplicate — the server
+  // auto-renames with smart indexing ("file.txt" -> "file 1.txt").
   const targetPath = currentPasteTargetPath();
-  els.btnPaste.disabled = cb.sourcePath === targetPath;
-  els.btnPaste.title =
-    cb.sourcePath === targetPath
-      ? "Already in this folder"
+  const sameFolder = cb.sourcePath === targetPath;
+  const canPaste = !sameFolder || cb.mode === "copy";
+  els.btnPaste.disabled = !canPaste;
+  els.btnPaste.title = !canPaste
+    ? "Already in this folder"
+    : sameFolder
+      ? "Duplicate in this folder (⌘/Ctrl+V)"
       : `Paste into /${targetPath} (⌘/Ctrl+V)`;
 }
 
@@ -904,20 +908,24 @@ async function pasteHere() {
   // source; copy: 409 conflicts on the freshly-written dest).
   if (els.btnPaste.disabled) return;
   const to = currentPasteTargetPath();
-  if (cb.sourcePath === to) return;
+  // Copy into the source folder = duplicate. The server dedupes every name
+  // with smart indexing, so no conflict prompt is needed.
+  const duplicate = cb.sourcePath === to;
+  if (duplicate && cb.mode !== "copy") return;
   const from = cb.names.map((n) =>
     cb.sourcePath ? `${cb.sourcePath}/${n}` : n,
   );
   const wasMove = cb.mode === "move";
   const targetIsCurrent = to === state.path;
-  const originalHTML = els.btnPaste.innerHTML;
+  const label = els.btnPaste.querySelector(".btn-label");
+  const originalLabel = label.textContent;
   els.btnPaste.disabled = true;
-  els.btnPaste.textContent = wasMove ? "Moving…" : "Copying…";
+  label.textContent = wasMove ? "Moving…" : duplicate ? "Duplicating…" : "Copying…";
   let result;
   try {
-    result = await runTransfer(cb.mode, from, to, "fail");
+    result = await runTransfer(cb.mode, from, to, duplicate ? "rename" : "fail");
   } finally {
-    els.btnPaste.innerHTML = originalHTML;
+    label.textContent = originalLabel;
   }
   if (!result) {
     // User cancelled — reset paste-button state via the normal renderer.

@@ -228,7 +228,7 @@ input[type="checkbox"] { accent-color: var(--accent); }
 /* Toolbar / modal-header icons — the SVGs in /public applied as masks so
    they inherit `currentColor` (light on ghost buttons, dark ink on the
    primary button). */
-.toolbar .icon, .editor-actions .icon {
+.toolbar .icon, .editor-actions .icon, .chip-actions .icon {
   width: 16px;
   height: 16px;
   flex: 0 0 auto;
@@ -244,6 +244,7 @@ input[type="checkbox"] { accent-color: var(--accent); }
 #btn-cut .icon { --icon: url("/cut.svg"); }
 #btn-copy .icon { --icon: url("/copy.svg"); }
 #btn-download .icon { --icon: url("/download.svg"); }
+#btn-paste .icon { --icon: url("/paste.svg"); }
 #preview-download .icon { --icon: url("/download.svg"); }
 /* Icon-only button (no label) — square padding so it doesn't stretch. */
 .btn.icon-btn { padding: 7px; }

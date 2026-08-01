@@ -784,7 +784,9 @@ async function handleRename(req: Request): Promise<Response> {
 /** Defensive cap on the number of entries a single move/copy can ask for. */
 const MAX_TRANSFER_PATHS = 10_000;
 
-type ConflictPolicy = "fail" | "overwrite" | "skip";
+// "rename" = auto-dedupe with smart indexing ("file.txt" -> "file 1.txt"),
+// used by copy-into-same-folder (duplicate). Only meaningful for copies.
+type ConflictPolicy = "fail" | "overwrite" | "skip" | "rename";
 
 /* -------------------------------------------------------------------------- */
 /*  Inline file editor — read raw bytes, save back atomically                 */
@@ -877,6 +879,41 @@ async function handlePutFile(req: Request, url: URL): Promise<Response> {
 
 
 /**
+ * Smart-indexed duplicate naming: "file.txt" -> "file 1.txt"; if that exists,
+ * "file 2.txt", and so on. Copying an already-indexed name continues its
+ * sequence ("file 1.txt" -> "file 2.txt"). Dotfiles like ".gitignore" count
+ * as extension-less. `taken` reserves names claimed earlier in the same batch
+ * so two entries can't dedupe onto each other before hitting the disk.
+ */
+async function dedupeDestName(
+  dir: string,
+  name: string,
+  taken: Set<string>,
+): Promise<string> {
+  const dot = name.lastIndexOf(".");
+  const hasExt = dot > 0; // a leading dot is a dotfile, not an extension
+  const rawBase = hasExt ? name.slice(0, dot) : name;
+  const ext = hasExt ? name.slice(dot) : "";
+  // Split off a trailing " N" index so we continue that sequence.
+  const m = /^(.*) (\d+)$/.exec(rawBase);
+  const stem = m ? m[1] : rawBase;
+  let n = m ? parseInt(m[2], 10) + 1 : 1;
+  let candidate = `${stem} ${n}${ext}`;
+  for (;;) {
+    if (!taken.has(candidate)) {
+      try {
+        await stat(join(dir, candidate));
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ENOENT") return candidate;
+        throw e;
+      }
+    }
+    n += 1;
+    candidate = `${stem} ${n}${ext}`;
+  }
+}
+
+/**
  * Shared core for /api/move and /api/copy. Validates a batch of source paths
  * against a target directory, surfaces conflicts up-front when the caller
  * opts in, and reports per-entry results so the client can show partial
@@ -905,7 +942,9 @@ async function handleTransfer(
       ? "overwrite"
       : body.onConflict === "skip"
         ? "skip"
-        : "fail";
+        : body.onConflict === "rename" && mode === "copy"
+          ? "rename"
+          : "fail";
 
   const toAbs = safeResolve(config.root, body.to, true);
   const toStat = await stat(toAbs);
@@ -947,7 +986,8 @@ async function handleTransfer(
   }
 
   // Up-front conflict probe — lets the client show a single Overwrite/Skip
-  // dialog instead of dribbling one error per file.
+  // dialog instead of dribbling one error per file. "rename" never prompts:
+  // conflicts are exactly what it resolves.
   if (onConflict === "fail") {
     const conflicts: string[] = [];
     for (const p of plans) {
@@ -968,29 +1008,41 @@ async function handleTransfer(
     name: string;
     status: "moved" | "copied" | "skipped" | "overwritten" | "error";
     error?: string;
+    /** Present when the entry landed under a deduped name ("rename" policy). */
+    as?: string;
   }
   const results: ResultEntry[] = [];
+  // Names claimed by earlier entries in this batch, so dedupe doesn't hand
+  // the same destination to two plans before either hits the disk.
+  const taken = new Set<string>();
 
   for (const p of plans) {
-    if (p.noop) {
+    // A move into the same folder is a no-op; a copy is a duplicate, which
+    // the "rename" policy handles below (src === dest always "exists").
+    if (p.noop && onConflict !== "rename") {
       results.push({ name: p.name, status: "skipped" });
       continue;
     }
     try {
+      let dest = p.dest;
+      let destName = p.name;
       let existed = false;
       try {
-        await stat(p.dest);
+        await stat(dest);
         existed = true;
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
       }
       if (existed) {
-        if (onConflict === "skip") {
+        if (onConflict === "rename") {
+          destName = await dedupeDestName(toAbs, p.name, taken);
+          dest = join(toAbs, destName);
+          existed = false;
+        } else if (onConflict === "skip") {
           results.push({ name: p.name, status: "skipped" });
           continue;
-        }
-        if (onConflict === "overwrite") {
-          await rm(p.dest, { recursive: true, force: true });
+        } else if (onConflict === "overwrite") {
+          await rm(dest, { recursive: true, force: true });
         }
         // onConflict === 'fail' here would have short-circuited above, but a
         // race could have created the file in the meantime. Treat it as a
@@ -1004,15 +1056,16 @@ async function handleTransfer(
           continue;
         }
       }
+      taken.add(destName);
 
       if (mode === "move") {
         try {
-          await rename(p.src, p.dest);
+          await rename(p.src, dest);
         } catch (e) {
           const code = (e as NodeJS.ErrnoException).code;
           if (code === "EXDEV") {
             // Different filesystem — fall back to copy + delete.
-            await cp(p.src, p.dest, { recursive: true, errorOnExist: false });
+            await cp(p.src, dest, { recursive: true, errorOnExist: false });
             await rm(p.src, { recursive: true, force: true });
           } else if (code === "EACCES" || code === "EPERM") {
             throw new PathError("Permission denied", 403);
@@ -1025,10 +1078,11 @@ async function handleTransfer(
           status: existed ? "overwritten" : "moved",
         });
       } else {
-        await cp(p.src, p.dest, { recursive: true, errorOnExist: false });
+        await cp(p.src, dest, { recursive: true, errorOnExist: false });
         results.push({
           name: p.name,
           status: existed ? "overwritten" : "copied",
+          ...(destName !== p.name ? { as: destName } : {}),
         });
       }
     } catch (e) {
