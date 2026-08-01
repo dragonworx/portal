@@ -54,21 +54,35 @@
 
     <section class="toolbar">
       <div class="toolbar-left">
-        <button id="btn-up" class="btn ghost" title="Go up one folder">↑ Up</button>
-        <button id="btn-refresh" class="btn ghost" title="Refresh listing">↻ Refresh</button>
-        <button id="btn-newfolder" class="btn ghost">+ New folder</button>
-        <button id="btn-newfile" class="btn ghost">+ New file</button>
-        <label class="btn ghost upload-label">
-          ⬆ Upload
+        <button id="btn-up" class="btn ghost" title="Go up one folder" aria-label="Up">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">Up</span>
+        </button>
+        <button id="btn-refresh" class="btn ghost" title="Refresh listing" aria-label="Refresh">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">Refresh</span>
+        </button>
+        <button id="btn-newfolder" class="btn ghost" title="New folder" aria-label="New folder">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">New folder</span>
+        </button>
+        <button id="btn-newfile" class="btn ghost" title="New file" aria-label="New file">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">New file</span>
+        </button>
+        <label class="btn ghost upload-label" title="Upload files" aria-label="Upload files">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">Upload</span>
           <input id="file-input" type="file" multiple hidden />
         </label>
       </div>
 
       <div class="toolbar-right">
         <span id="selection-summary" class="muted">No items selected</span>
-        <button id="btn-cut" class="btn ghost" disabled title="Cut (⌘/Ctrl+X)">✂ Cut</button>
-        <button id="btn-copy" class="btn ghost" disabled title="Copy (⌘/Ctrl+C)">❐ Copy</button>
-        <button id="btn-download" class="btn primary" disabled>Download</button>
+        <button id="btn-cut" class="btn ghost" disabled title="Cut (⌘/Ctrl+X)" aria-label="Cut">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">Cut</span>
+        </button>
+        <button id="btn-copy" class="btn ghost" disabled title="Copy (⌘/Ctrl+C)" aria-label="Copy">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">Copy</span>
+        </button>
+        <button id="btn-download" class="btn primary" disabled title="Download selected" aria-label="Download">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">Download</span>
+        </button>
       </div>
     </section>
 

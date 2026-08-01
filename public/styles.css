@@ -216,6 +216,25 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .btn.tiny { padding: 3px 8px; font-size: 11px; }
 .upload-label { cursor: pointer; }
 
+/* Toolbar icons — the SVGs in /public applied as masks so they inherit
+   `currentColor` (light on ghost buttons, dark ink on the primary button). */
+.toolbar .icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  background-color: currentColor;
+  -webkit-mask: var(--icon) center / contain no-repeat;
+  mask: var(--icon) center / contain no-repeat;
+}
+#btn-up .icon { --icon: url("/up.svg"); }
+#btn-refresh .icon { --icon: url("/refresh.svg"); }
+#btn-newfolder .icon { --icon: url("/create-folder.svg"); }
+#btn-newfile .icon { --icon: url("/create-file.svg"); }
+.upload-label .icon { --icon: url("/upload.svg"); }
+#btn-cut .icon { --icon: url("/cut.svg"); }
+#btn-copy .icon { --icon: url("/copy.svg"); }
+#btn-download .icon { --icon: url("/download.svg"); }
+
 /* ---------- Clipboard chip (pending move/copy banner) ---------- */
 .clipboard-chip {
   display: flex;
@@ -866,9 +885,17 @@ body.preview-open { overflow: hidden; }
   .user { max-width: 160px; }
   .user-email { max-width: 100px; }
 
-  .toolbar { padding: 6px 12px; overflow-x: auto; scrollbar-width: none; }
+  /* Icon-only toolbar on phones: labels drop, buttons stretch to fill the
+     row (groups flex 5:3 so all 8 buttons stay equal width), icons as large
+     as fits down to 320px portrait. overflow-x stays as a safety net. */
+  .toolbar { padding: 6px 8px; gap: 6px; overflow-x: auto; scrollbar-width: none; }
   .toolbar::-webkit-scrollbar { display: none; }
-  .toolbar-left, .toolbar-right { flex: 0 0 auto; }
+  .toolbar-left { flex: 5 1 0; }
+  .toolbar-right { flex: 3 1 0; }
+  .toolbar-left, .toolbar-right { gap: 6px; min-width: 0; }
+  .toolbar .btn { flex: 1 1 0; justify-content: center; min-width: 0; padding: 8px 2px; }
+  .toolbar .btn-label { display: none; }
+  .toolbar .icon { width: 24px; height: 24px; }
   #selection-summary { display: none; }
 
   .list-header, .row { padding: 0 10px; }

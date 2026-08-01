@@ -841,7 +841,7 @@ async function downloadSelection() {
   const paths = sel.map((e) => joinPath(e.name));
   const zipName = inferZipName(sel);
   els.btnDownload.disabled = true;
-  els.btnDownload.textContent = "Zipping…";
+  els.btnDownload.querySelector(".btn-label").textContent = "Zipping…";
   try {
     const res = await api("/api/zip", {
       method: "POST",
@@ -856,7 +856,7 @@ async function downloadSelection() {
     alert(`Zip failed: ${err.message}`);
   } finally {
     els.btnDownload.disabled = false;
-    els.btnDownload.textContent = "Download";
+    els.btnDownload.querySelector(".btn-label").textContent = "Download";
   }
 }
 
