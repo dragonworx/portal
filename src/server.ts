@@ -401,14 +401,23 @@ async function handleDownload(url: URL): Promise<Response> {
 /** MIME allowlist for /api/stream. Keeping this tight means the endpoint can
  *  only ever serve inert media types (never HTML/SVG/JS), so — unlike
  *  /api/download — inline playback carries no XSS risk. Must stay in sync
- *  with VIDEO_EXTS in public/app.js. */
-const STREAM_VIDEO_MIME: Record<string, string> = {
+ *  with VIDEO_EXTS / AUDIO_EXTS in public/app.js. */
+const STREAM_MEDIA_MIME: Record<string, string> = {
   mp4: "video/mp4",
   m4v: "video/mp4",
   webm: "video/webm",
   mov: "video/quicktime",
   ogv: "video/ogg",
   mkv: "video/x-matroska",
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  wav: "audio/wav",
+  flac: "audio/flac",
+  ogg: "audio/ogg",
+  oga: "audio/ogg",
+  opus: "audio/ogg",
+  weba: "audio/webm",
 };
 
 function extOfName(name: string): string {
@@ -417,8 +426,8 @@ function extOfName(name: string): string {
 }
 
 /**
- * Stream a video file for inline playback in the preview modal. Unlike
- * /api/download this serves the real video MIME type and answers Range
+ * Stream an audio/video file for inline playback in the preview modal. Unlike
+ * /api/download this serves the real media MIME type and answers Range
  * requests (206) — players issue partial requests for the initial metadata
  * and for every seek, so without range support the browser has to buffer
  * the whole file before playback can start (fatal on mobile).
@@ -430,7 +439,7 @@ async function handleStream(url: URL, req: Request): Promise<Response> {
   if (st.isDirectory()) {
     throw new PathError("Not a file", 400);
   }
-  const mime = STREAM_VIDEO_MIME[extOfName(basename(target))];
+  const mime = STREAM_MEDIA_MIME[extOfName(basename(target))];
   if (!mime) {
     throw new PathError("Unsupported media type", 415);
   }

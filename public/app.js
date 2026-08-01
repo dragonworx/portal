@@ -256,10 +256,11 @@ function filteredEntries() {
 /*  Single source of truth linking a listing entry to (a) the viewer that   */
 /*  opens when its row is clicked and (b) the icon shown for it in the      */
 /*  file view. Kinds: "folder" (drills in), "text" (read-only CodeMirror),  */
-/*  "image" (<img> preview), "video" (<video> player), "binary" (fallback   */
-/*  panel with download). The extension sets these checks rely on live      */
-/*  with their viewers below (IMAGE_EXTS / VIDEO_EXTS in "File preview",    */
-/*  BINARY_EXTS in "Inline text editor"); they are read lazily at           */
+/*  "image" (<img> preview), "video" (<video> player), "audio" (<audio>     */
+/*  player), "binary" (fallback panel with download). The extension sets    */
+/*  these checks rely on live with their viewers below (IMAGE_EXTS /        */
+/*  VIDEO_EXTS / AUDIO_EXTS in "File preview", BINARY_EXTS in "Inline text  */
+/*  editor"); they are read lazily at                                       */
 /*  row-render / preview-open time, never during module evaluation.         */
 /* -------------------------------------------------------------------------- */
 
@@ -268,6 +269,7 @@ const VIEW_KINDS = {
   text: { icon: "file-text", title: "Text file" },
   image: { icon: "file-image", title: "Image" },
   video: { icon: "file-video", title: "Video" },
+  audio: { icon: "file-audio", title: "Audio" },
   binary: { icon: "file-binary", title: "Binary file" },
 };
 
@@ -277,6 +279,7 @@ function viewKindFor(entry) {
   const ext = extOf(entry.name);
   if (IMAGE_EXTS.has(ext)) return "image";
   if (VIDEO_EXTS.has(ext)) return "video";
+  if (AUDIO_EXTS.has(ext)) return "audio";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
 }
@@ -1758,8 +1761,14 @@ const IMAGE_MIME = {
 /** Extensions we hand to the <video> player. Formats the browser can't
  *  decode (e.g. some MKV codecs) fail gracefully in the player with an
  *  error note pointing at the Download button. Must stay in sync with
- *  STREAM_VIDEO_MIME in src/server.ts (the /api/stream allowlist). */
+ *  STREAM_MEDIA_MIME in src/server.ts (the /api/stream allowlist). */
 const VIDEO_EXTS = new Set(["mp4", "m4v", "webm", "mov", "ogv", "mkv"]);
+
+/** Extensions we hand to the <audio> player. Same graceful-failure deal as
+ *  VIDEO_EXTS, and likewise must stay in sync with STREAM_MEDIA_MIME. */
+const AUDIO_EXTS = new Set([
+  "mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "weba",
+]);
 
 const previewState = {
   /** Relative path being previewed, or null when the preview is closed. */
@@ -1793,6 +1802,8 @@ async function openPreview(entry) {
       await showImagePreview(fullPath, entry, ext);
     } else if (kind === "video") {
       await showVideoPreview(fullPath, entry, ext);
+    } else if (kind === "audio") {
+      await showAudioPreview(fullPath, entry, ext);
     } else {
       await showTextPreview(fullPath, entry);
     }
@@ -2004,6 +2015,141 @@ async function showVideoPreview(fullPath, entry, ext) {
 
   els.previewMeta.textContent = meta;
   els.previewBody.replaceChildren(wrap);
+
+  // Auto-play as soon as the player is on screen. Browsers block unmuted
+  // autoplay, so on rejection fall back to muted playback and reflect the
+  // muted state in the control bar.
+  video.play().catch(() => {
+    video.muted = true;
+    muteIcon.classList.toggle("icon-sound-on", false);
+    muteIcon.classList.toggle("icon-sound-off", true);
+    muteBtn.setAttribute("aria-label", "Unmute");
+    video.play().catch(() => {});
+  });
+}
+
+async function showAudioPreview(fullPath, entry, ext) {
+  // Same streaming approach as the video player: range requests against
+  // /api/stream keep seeks snappy and the file out of memory.
+  const wrap = document.createElement("div");
+  wrap.className = "preview-video-wrap preview-audio-wrap";
+
+  // There's no picture to show, so a large file-audio glyph stands in for
+  // the <video> element; the <audio> itself has no visual representation.
+  const artwork = document.createElement("span");
+  artwork.className = "preview-audio-icon";
+  artwork.setAttribute("aria-hidden", "true");
+
+  const audio = document.createElement("audio");
+  audio.preload = "metadata";
+  audio.src = `/api/stream?path=${encodeURIComponent(fullPath)}`;
+
+  const meta = await new Promise((resolve, reject) => {
+    audio.addEventListener("loadedmetadata", () =>
+      resolve(
+        `${ext.toUpperCase()} • ${fmtDuration(audio.duration)}` +
+          ` • ${fmtSize(entry.size)}`,
+      ),
+    );
+    audio.addEventListener("error", () =>
+      reject(
+        new Error("this audio format cannot be decoded by the browser"),
+      ),
+    );
+  });
+
+  if (previewState.path !== fullPath) return;
+
+  // Custom control bar — the same components as the video player (play /
+  // pause, position, seek, mute), minus fullscreen.
+  const controls = document.createElement("div");
+  controls.className = "video-controls";
+
+  const playBtn = document.createElement("button");
+  playBtn.type = "button";
+  playBtn.className = "video-btn";
+  const playIcon = document.createElement("span");
+  playIcon.className = "icon icon-play";
+  playIcon.setAttribute("aria-hidden", "true");
+  playBtn.append(playIcon);
+  playBtn.setAttribute("aria-label", "Play");
+
+  const time = document.createElement("span");
+  time.className = "video-time";
+  time.textContent = `0:00 / ${fmtDuration(audio.duration)}`;
+
+  const seek = document.createElement("input");
+  seek.type = "range";
+  seek.className = "video-seek";
+  seek.min = "0";
+  seek.max = "1000";
+  seek.value = "0";
+  seek.step = "1";
+  seek.setAttribute("aria-label", "Seek");
+
+  const muteBtn = document.createElement("button");
+  muteBtn.type = "button";
+  muteBtn.className = "video-btn";
+  const muteIcon = document.createElement("span");
+  muteIcon.className = "icon icon-sound-on";
+  muteIcon.setAttribute("aria-hidden", "true");
+  muteBtn.append(muteIcon);
+  muteBtn.setAttribute("aria-label", "Mute");
+
+  controls.append(playBtn, time, seek, muteBtn);
+  wrap.append(artwork, audio, controls);
+
+  const syncPlayBtn = () => {
+    playIcon.classList.toggle("icon-play", audio.paused);
+    playIcon.classList.toggle("icon-pause", !audio.paused);
+    playBtn.setAttribute("aria-label", audio.paused ? "Play" : "Pause");
+  };
+  const togglePlay = () => {
+    if (audio.paused) audio.play().catch(() => {});
+    else audio.pause();
+  };
+  playBtn.addEventListener("click", togglePlay);
+  audio.addEventListener("play", syncPlayBtn);
+  audio.addEventListener("pause", syncPlayBtn);
+
+  // Don't fight the user's drag: only move the slider from playback events
+  // while they aren't holding it.
+  let seekDragging = false;
+  audio.addEventListener("timeupdate", () => {
+    if (!seekDragging && audio.duration) {
+      seek.value = String(
+        Math.round((audio.currentTime / audio.duration) * 1000),
+      );
+    }
+    time.textContent =
+      `${fmtDuration(audio.currentTime)} / ${fmtDuration(audio.duration)}`;
+  });
+  seek.addEventListener("input", () => {
+    seekDragging = true;
+    if (audio.duration) {
+      audio.currentTime = (Number(seek.value) / 1000) * audio.duration;
+    }
+  });
+  seek.addEventListener("change", () => {
+    seekDragging = false;
+  });
+
+  // A mute toggle rather than a volume slider: on iOS the volume is
+  // hardware-only and slider changes are ignored.
+  muteBtn.addEventListener("click", () => {
+    audio.muted = !audio.muted;
+    muteIcon.classList.toggle("icon-sound-on", !audio.muted);
+    muteIcon.classList.toggle("icon-sound-off", audio.muted);
+    muteBtn.setAttribute("aria-label", audio.muted ? "Unmute" : "Mute");
+  });
+
+  els.previewMeta.textContent = meta;
+  els.previewBody.replaceChildren(wrap);
+
+  // Auto-play as soon as the player is on screen. Unlike the video player
+  // there's no muted fallback — silent audio is pointless — so a blocked
+  // autoplay simply leaves the player paused.
+  audio.play().catch(() => {});
 }
 
 async function showTextPreview(fullPath, entry) {
@@ -2083,10 +2229,10 @@ function previewNote(icon, message, detail) {
 
 function closePreview() {
   if (!previewState.path) return;
-  // Pause any playing video first — a detached <video> can keep playing
-  // audio after its DOM is dropped.
-  const video = els.previewBody.querySelector("video");
-  if (video) video.pause();
+  // Pause any playing media first — a detached <video>/<audio> can keep
+  // playing audio after its DOM is dropped.
+  const media = els.previewBody.querySelector("video, audio");
+  if (media) media.pause();
   els.previewModal.hidden = true;
   document.body.classList.remove("preview-open");
   if (previewState.objectUrl) {
