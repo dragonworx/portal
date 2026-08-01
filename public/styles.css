@@ -25,7 +25,7 @@
      redefined per breakpoint. The leading check column only exists while
      selection mode is on (or a cut/copy is pending, which uses the column
      for destination radios); otherwise it's reclaimed entirely. */
-  --list-cols: 1fr 110px 170px 108px;
+  --list-cols: 1fr 170px 108px 110px;
   --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
@@ -364,7 +364,7 @@ input[type="checkbox"] { accent-color: var(--accent); }
    track, shifting every other cell one column to the right. Hiding the
    whole cell leaves exactly as many grid items as there are tracks, so
    the name column can stretch to fill the row. */
-body.select-mode, body.clipboard-active { --list-cols: 40px 1fr 110px 170px 108px; }
+body.select-mode, body.clipboard-active { --list-cols: 40px 1fr 170px 108px 110px; }
 body:not(.select-mode):not(.clipboard-active) .cell-check { display: none; }
 
 /* Row checkboxes use the checkbox SVGs as masks so they inherit the theme
@@ -460,6 +460,9 @@ body.select-anim .cell-check input[type="checkbox"] {
   text-overflow: ellipsis;
 }
 .row .name {
+  /* min-width: 0 lets the flex item shrink below its content width so the
+     ellipsis can actually kick in on long names. */
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -490,6 +493,15 @@ body.select-anim .cell-check input[type="checkbox"] {
   font-variant-numeric: tabular-nums;
   color: var(--text-dim);
   font-size: 15px;
+}
+
+/* Size is the rightmost column: right-align the value and clip with an
+   ellipsis if it ever outgrows its fixed track. */
+.cell-size {
+  text-align: right;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 /* Hover-revealed row actions (edit / delete). On touch devices there is no
@@ -973,6 +985,77 @@ body.editor-open { overflow: hidden; }
 .editor-body .cm-link       { color: var(--accent); }
 .editor-body .cm-error      { color: var(--bad); }
 
+/* ---------- Custom dialogs (alert/confirm/prompt replacements) ---------- */
+/* Sits above the editor/preview modals (z-index 100) so confirmations like
+   "discard unsaved changes?" can stack on top of them. */
+.ui-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(4, 5, 9, 0.82);
+  backdrop-filter: blur(4px);
+  animation: editor-fade 0.12s ease-out;
+}
+
+.ui-dialog-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(480px, 100%);
+  padding: 20px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+}
+
+.ui-dialog-title { font-size: 17.5px; font-weight: 600; }
+
+.ui-dialog-message {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1.5;
+  /* Dialog messages use \n for paragraph breaks. */
+  white-space: pre-line;
+}
+
+.ui-dialog-input {
+  padding: 8px 10px;
+  background: var(--bg-row);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 15px;
+  font-family: inherit;
+}
+.ui-dialog-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+
+.ui-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* Destructive confirm button (delete, overwrite, discard). */
+.btn.danger {
+  background: linear-gradient(135deg, var(--bad), #d63a56);
+  border-color: transparent;
+  color: #2b060d;
+  font-weight: 600;
+  box-shadow: var(--glow-bad);
+}
+.btn.danger:hover:not(:disabled) { filter: brightness(1.12); }
+
 /* ---------- File preview (modal) ---------- */
 /* Lock background scroll while the preview is open. */
 body.preview-open { overflow: hidden; }
@@ -1112,8 +1195,8 @@ body.preview-open { overflow: hidden; }
 /* ---------- Responsive: tablet (≤ 900px) ---------- */
 @media (max-width: 900px) {
   /* Drop the "Modified" column — least useful on small screens. */
-  :root { --list-cols: 1fr 90px 104px; }
-  body.select-mode, body.clipboard-active { --list-cols: 40px 1fr 90px 104px; }
+  :root { --list-cols: 1fr 104px 90px; }
+  body.select-mode, body.clipboard-active { --list-cols: 40px 1fr 104px 90px; }
   .cell-mtime { display: none; }
   .search input { width: 180px; }
 }

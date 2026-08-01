@@ -78,11 +78,160 @@ const state = {
 };
 
 /* -------------------------------------------------------------------------- */
+/*  Dialogs — custom replacements for window.alert / confirm / prompt         */
+/*                                                                            */
+/*  All user confirmation / input flows route through openDialog(), which     */
+/*  builds a promise-based modal matching the app's neon theme. Keys are     */
+/*  captured at the document level so global shortcuts (e.g. Esc clearing    */
+/*  the clipboard) don't fire while a dialog is up.                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Core modal dialog.
+ * @param {object} opts
+ * @param {string} opts.title    Heading text.
+ * @param {string} opts.message  Body text (newlines are preserved).
+ * @param {{placeholder?:string,value?:string}|null} [opts.input]
+ *        When set, a text field is shown and its value returned.
+ * @param {{id:string,label:string,style?:string,default?:boolean}[]} opts.buttons
+ *        `style` is an extra .btn class ("primary" | "danger" | "ghost").
+ *        The button flagged `default` fires on Enter.
+ * @returns {Promise<{action:string|null,value:string|null}>}
+ *   `action` is the clicked button's id, or null when cancelled via
+ *   Escape / backdrop click.
+ */
+function openDialog({ title, message, input = null, buttons }) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "ui-dialog";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+
+    const shell = document.createElement("div");
+    shell.className = "ui-dialog-shell";
+
+    const head = document.createElement("strong");
+    head.className = "ui-dialog-title";
+    head.textContent = title;
+
+    const body = document.createElement("p");
+    body.className = "ui-dialog-message";
+    body.textContent = message;
+
+    shell.append(head, body);
+
+    let inputEl = null;
+    if (input) {
+      inputEl = document.createElement("input");
+      inputEl.type = "text";
+      inputEl.className = "ui-dialog-input";
+      inputEl.placeholder = input.placeholder || "";
+      inputEl.value = input.value || "";
+      inputEl.spellcheck = false;
+      inputEl.autocapitalize = "off";
+      inputEl.autocomplete = "off";
+      shell.appendChild(inputEl);
+    }
+
+    const footer = document.createElement("div");
+    footer.className = "ui-dialog-actions";
+    /** @type {HTMLButtonElement|null} */
+    let defaultBtn = null;
+    const done = (action) => {
+      document.removeEventListener("keydown", onKey, true);
+      overlay.remove();
+      resolve({ action, value: inputEl ? inputEl.value : null });
+    };
+    for (const b of buttons) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `btn ${b.style || ""}`.trim();
+      btn.textContent = b.label;
+      btn.addEventListener("click", () => done(b.id));
+      footer.appendChild(btn);
+      if (b.default) defaultBtn = btn;
+    }
+    shell.appendChild(footer);
+    overlay.appendChild(shell);
+
+    const cancel = () => done(null);
+    // Clicking the dim backdrop cancels.
+    overlay.addEventListener("click", (ev) => {
+      if (ev.target === overlay) cancel();
+    });
+    const onKey = (ev) => {
+      // Capture phase + stopPropagation: global shortcuts (clipboard clear,
+      // editor Esc, etc.) must not fire while the dialog is up.
+      ev.stopPropagation();
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        cancel();
+      } else if (ev.key === "Enter" && defaultBtn) {
+        ev.preventDefault();
+        defaultBtn.click();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+
+    document.body.appendChild(overlay);
+    if (inputEl) {
+      inputEl.focus();
+      inputEl.select();
+    } else if (defaultBtn) {
+      defaultBtn.focus();
+    }
+  });
+}
+
+/** alert() replacement — informational, single OK button. */
+function uiAlert(message, title = "Portal") {
+  return openDialog({
+    title,
+    message,
+    buttons: [{ id: "ok", label: "OK", style: "primary", default: true }],
+  }).then(() => undefined);
+}
+
+/** confirm() replacement — resolves true (confirm) / false (cancel). For
+ *  dangerous actions pass danger: true, which styles the confirm button red
+ *  and makes Cancel the default (Enter-safe) choice. */
+function uiConfirm(
+  message,
+  { title = "Confirm", confirmLabel = "OK", danger = false } = {},
+) {
+  return openDialog({
+    title,
+    message,
+    buttons: [
+      { id: "cancel", label: "Cancel", style: "ghost", default: danger },
+      { id: "ok", label: confirmLabel, style: danger ? "danger" : "primary", default: !danger },
+    ],
+  }).then((r) => r.action === "ok");
+}
+
+/** prompt() replacement — resolves the entered text, or null when cancelled. */
+function uiPrompt(
+  message,
+  { title = "Portal", placeholder = "", value = "", confirmLabel = "OK" } = {},
+) {
+  return openDialog({
+    title,
+    message,
+    input: { placeholder, value },
+    buttons: [
+      { id: "cancel", label: "Cancel", style: "ghost" },
+      { id: "ok", label: confirmLabel, style: "primary", default: true },
+    ],
+  }).then((r) => (r.action === "ok" ? r.value : null));
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Formatting                                                                */
 /* -------------------------------------------------------------------------- */
 
 function fmtSize(n) {
-  if (!n) return "—";
+  // Only "no value" gets a dash — a real 0-byte file should read "0 B".
+  if (n == null) return "—";
   const units = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
   let v = n;
@@ -217,7 +366,7 @@ async function loadPath(path) {
     }
   } catch (err) {
     setConnected(false);
-    alert(`Failed to load: ${err.message}`);
+    uiAlert(`Failed to load: ${err.message}`, "Could not load folder");
   }
 }
 
@@ -466,7 +615,8 @@ function buildRow(entry, index) {
   });
   actions.append(moreBtn);
 
-  row.append(check, name, size, mtime, actions);
+  // Size is the last column so it sits as far right as possible.
+  row.append(check, name, mtime, actions, size);
 
   // Single click on a dir drills in; on a file it opens the preview. In
   // select mode a tap instead toggles the row's checkbox — opening entries
@@ -779,7 +929,7 @@ async function commitRename(entry) {
     renderList();
     renderSelection();
   } catch (err) {
-    alert(`Rename failed: ${err.message}`);
+    uiAlert(`Rename failed: ${err.message}`);
     // Revert: re-open the editor on the original row with what the user typed
     // so they can correct and retry without retyping from scratch.
     if (state.entries.some((e) => e.name === original)) {
@@ -798,7 +948,12 @@ async function deleteEntry(entry) {
     entry.type === "dir"
       ? `Delete folder “${entry.name}” and everything inside it?\n\nThis cannot be undone.`
       : `Delete file “${entry.name}”?\n\nThis cannot be undone.`;
-  if (!confirm(warn)) return;
+  const ok = await uiConfirm(warn, {
+    title: `Delete ${kind}`,
+    confirmLabel: "Delete",
+    danger: true,
+  });
+  if (!ok) return;
   try {
     await api("/api/delete", {
       method: "POST",
@@ -837,7 +992,7 @@ async function deleteEntry(entry) {
     renderList();
     renderSelection();
   } catch (err) {
-    alert(`Could not delete ${kind}: ${err.message}`);
+    uiAlert(`Could not delete ${kind}: ${err.message}`);
   }
 }
 
@@ -978,7 +1133,7 @@ async function runTransfer(mode, from, to, onConflict) {
       body: JSON.stringify({ from, to, onConflict }),
     });
   } catch (err) {
-    alert(`${mode === "move" ? "Move" : "Copy"} failed: ${err.message}`);
+    uiAlert(`${mode === "move" ? "Move" : "Copy"} failed: ${err.message}`);
     return null;
   }
   if (res.status === 401) {
@@ -1000,24 +1155,29 @@ async function runTransfer(mode, from, to, onConflict) {
     } catch {
       /* ignore */
     }
-    alert(`${mode === "move" ? "Move" : "Copy"} failed: ${msg}`);
+    uiAlert(`${mode === "move" ? "Move" : "Copy"} failed: ${msg}`);
     return null;
   }
   return await res.json();
 }
 
-function askConflictResolution(conflicts) {
+async function askConflictResolution(conflicts) {
   const list = conflicts.slice(0, 8).join(", ");
   const more = conflicts.length > 8 ? ` …and ${conflicts.length - 8} more` : "";
-  const msg =
-    `The destination already contains:\n  ${list}${more}\n\n` +
-    `Click OK to overwrite, Cancel to skip these and keep going. ` +
-    `(Choose Cancel on the next prompt to abort entirely.)`;
-  if (confirm(msg)) return Promise.resolve("overwrite");
-  if (confirm("Skip the conflicting items and transfer the rest?")) {
-    return Promise.resolve("skip");
-  }
-  return Promise.resolve(null);
+  const r = await openDialog({
+    title: "Name conflicts",
+    message:
+      `The destination already contains:\n  ${list}${more}\n\n` +
+      "Overwrite replaces those items; Skip transfers only the rest; " +
+      "Abort cancels the whole transfer.",
+    buttons: [
+      { id: "abort", label: "Abort", style: "ghost" },
+      { id: "skip", label: "Skip", style: "primary", default: true },
+      { id: "overwrite", label: "Overwrite", style: "danger" },
+    ],
+  });
+  if (r.action === "overwrite" || r.action === "skip") return r.action;
+  return null;
 }
 
 function summariseTransferResult(mode, body) {
@@ -1031,8 +1191,9 @@ function summariseTransferResult(mode, body) {
   if (errors.length > 0) {
     const verb = mode === "move" ? "moved" : "copied";
     const ok = counts.moved + counts.copied + counts.overwritten;
-    alert(
+    uiAlert(
       `${ok} ${verb}, ${errors.length} failed:\n\n${errors.slice(0, 10).join("\n")}`,
+      "Transfer finished with errors",
     );
   }
 }
@@ -1070,7 +1231,7 @@ async function downloadSelection() {
     triggerDownload(objUrl, zipName);
     setTimeout(() => URL.revokeObjectURL(objUrl), 30_000);
   } catch (err) {
-    alert(`Zip failed: ${err.message}`);
+    uiAlert(`Zip failed: ${err.message}`);
   } finally {
     els.btnDownload.disabled = false;
     els.btnDownload.querySelector(".btn-label").textContent = "Download";
@@ -1311,7 +1472,11 @@ els.uploadsClear.addEventListener("click", () => {
 });
 
 els.btnNewFolder.addEventListener("click", async () => {
-  const name = prompt("New folder name");
+  const name = await uiPrompt("Choose a name for the new folder.", {
+    title: "New folder",
+    placeholder: "Folder name",
+    confirmLabel: "Create",
+  });
   if (!name) return;
   try {
     await api("/api/mkdir", {
@@ -1321,12 +1486,16 @@ els.btnNewFolder.addEventListener("click", async () => {
     });
     loadPath(state.path);
   } catch (err) {
-    alert(`Could not create folder: ${err.message}`);
+    uiAlert(`Could not create folder: ${err.message}`);
   }
 });
 
 els.btnNewFile.addEventListener("click", async () => {
-  const raw = prompt("New file name");
+  const raw = await uiPrompt("Choose a name for the new file.", {
+    title: "New file",
+    placeholder: "File name",
+    confirmLabel: "Create",
+  });
   if (!raw) return;
   const name = raw.trim();
   if (!name) return;
@@ -1339,7 +1508,7 @@ els.btnNewFile.addEventListener("click", async () => {
     });
     created = await res.json();
   } catch (err) {
-    alert(`Could not create file: ${err.message}`);
+    uiAlert(`Could not create file: ${err.message}`);
     return;
   }
   await loadPath(state.path);
@@ -1514,7 +1683,7 @@ async function openEditor(entry) {
   try {
     res = await api(`/api/file?path=${encodeURIComponent(joinPath(entry.name))}`);
   } catch (err) {
-    alert(`Could not open file: ${err.message}`);
+    uiAlert(`Could not open file: ${err.message}`);
     return;
   }
 
@@ -1522,7 +1691,7 @@ async function openEditor(entry) {
   try {
     bytes = new Uint8Array(await res.arrayBuffer());
   } catch (err) {
-    alert(`Could not read file: ${err.message}`);
+    uiAlert(`Could not read file: ${err.message}`);
     return;
   }
 
@@ -1542,7 +1711,7 @@ async function openEditor(entry) {
   try {
     await ensureCodeMirror();
   } catch (err) {
-    alert(`Editor failed to load: ${err.message}`);
+    uiAlert(`Editor failed to load: ${err.message}`);
     return;
   }
   const modeInfo = detectMode(entry.name);
@@ -1628,10 +1797,11 @@ async function saveEditor() {
     return;
   }
   if (editorState.looksBinary) {
-    const ok = confirm(
+    const ok = await uiConfirm(
       "This file appears to be binary. Saving the text shown will " +
         "permanently overwrite the original bytes and likely corrupt it.\n\n" +
         "Continue anyway?",
+      { title: "Binary file warning", confirmLabel: "Save anyway", danger: true },
     );
     if (!ok) return;
   }
@@ -1676,7 +1846,7 @@ async function saveEditor() {
     closeEditor(true);
     if (parent === state.path) loadPath(state.path);
   } catch (err) {
-    alert(`Save failed: ${err.message}`);
+    uiAlert(`Save failed: ${err.message}`);
   } finally {
     els.editorSave.textContent = prevLabel;
     // disabled state will get refreshed by next change event or close()
@@ -1687,13 +1857,18 @@ async function saveEditor() {
   }
 }
 
-function closeEditor(force) {
+async function closeEditor(force) {
   if (!editorState.path) return;
   const dirty =
     editorState.cm &&
     editorState.cm.getValue() !== editorState.originalText;
   if (dirty && !force) {
-    if (!confirm("Discard unsaved changes?")) return;
+    const ok = await uiConfirm("Discard unsaved changes?", {
+      title: "Unsaved changes",
+      confirmLabel: "Discard",
+      danger: true,
+    });
+    if (!ok) return;
   }
   els.editorModal.hidden = true;
   document.body.classList.remove("editor-open");
