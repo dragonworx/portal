@@ -342,6 +342,11 @@ others so a slip in any single check doesn't open a hole.
   This neutralises stored-XSS via uploaded `.html`/`.svg`/`.pdf` (the
   browser refuses to render them inline, so a malicious file can't execute
   in our origin and steal other users' sessions).
+- **`/api/stream` is the one exception to forced `octet-stream`**: it serves
+  inline video for the preview player, but only from a hard-coded allowlist
+  of inert `video/*` MIME types (mp4/webm/mov/…), so it can never be used to
+  smuggle executable HTML/SVG/JS into the origin. It answers `Range`
+  requests (206) so players can seek without buffering the whole file.
 - **Strict CSP** on every HTML response:
   `default-src 'self'; script-src 'self'; style-src 'self'; …; object-src 'none'; frame-ancestors 'none'; base-uri 'none'`.
   Inline scripts and remote loads are blocked.
@@ -392,6 +397,7 @@ others so a slip in any single check doesn't open a hole.
 | GET    | `/api/me`                         | Current user (`{email, authEnabled}`)    | yes  |
 | GET    | `/api/list?path=…`                | List a directory                         | yes  |
 | GET    | `/api/download?path=…`            | Download a single file                   | yes  |
+| GET    | `/api/stream?path=…`              | Stream a video file (Range/206 support)  | yes  |
 | POST   | `/api/zip`                        | `{ paths: [], name? }` → streamed zip    | yes  |
 | POST   | `/api/upload?path=…&name=…`       | Raw body, file written to `path/name`    | yes  |
 | POST   | `/api/mkdir`                      | `{ path, name }` → create subdirectory   | yes  |

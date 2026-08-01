@@ -398,6 +398,80 @@ async function handleDownload(url: URL): Promise<Response> {
   });
 }
 
+/** MIME allowlist for /api/stream. Keeping this tight means the endpoint can
+ *  only ever serve inert media types (never HTML/SVG/JS), so — unlike
+ *  /api/download — inline playback carries no XSS risk. Must stay in sync
+ *  with VIDEO_EXTS in public/app.js. */
+const STREAM_VIDEO_MIME: Record<string, string> = {
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  webm: "video/webm",
+  mov: "video/quicktime",
+  ogv: "video/ogg",
+  mkv: "video/x-matroska",
+};
+
+function extOfName(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i >= 0 && i < name.length - 1 ? name.slice(i + 1).toLowerCase() : "";
+}
+
+/**
+ * Stream a video file for inline playback in the preview modal. Unlike
+ * /api/download this serves the real video MIME type and answers Range
+ * requests (206) — players issue partial requests for the initial metadata
+ * and for every seek, so without range support the browser has to buffer
+ * the whole file before playback can start (fatal on mobile).
+ */
+async function handleStream(url: URL, req: Request): Promise<Response> {
+  const requested = url.searchParams.get("path") ?? "";
+  const target = safeResolve(config.root, requested, true);
+  const st = await stat(target);
+  if (st.isDirectory()) {
+    throw new PathError("Not a file", 400);
+  }
+  const mime = STREAM_VIDEO_MIME[extOfName(basename(target))];
+  if (!mime) {
+    throw new PathError("Unsupported media type", 415);
+  }
+  const file = Bun.file(target);
+  const headers: Record<string, string> = {
+    "content-type": mime,
+    "accept-ranges": "bytes",
+    "cache-control": "private, no-store",
+  };
+
+  const range = req.headers.get("range");
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+    if (m && (m[1] !== "" || m[2] !== "")) {
+      const start =
+        m[1] === "" ? Math.max(0, st.size - Number(m[2])) : Number(m[1]);
+      const end =
+        m[1] !== "" && m[2] !== ""
+          ? Math.min(Number(m[2]), st.size - 1)
+          : st.size - 1;
+      if (start >= st.size || start > end) {
+        return new Response(null, {
+          status: 416,
+          headers: { "content-range": `bytes */${st.size}` },
+        });
+      }
+      return new Response(file.slice(start, end + 1), {
+        status: 206,
+        headers: {
+          ...headers,
+          "content-range": `bytes ${start}-${end}/${st.size}`,
+          "content-length": String(end - start + 1),
+        },
+      });
+    }
+  }
+  return new Response(file, {
+    headers: { ...headers, "content-length": String(st.size) },
+  });
+}
+
 async function handleZip(req: Request): Promise<Response> {
   const body = (await readJsonLimited(req, JSON_BODY_LIMIT)) as {
     paths?: unknown;
@@ -1242,6 +1316,9 @@ Bun.serve({
       }
       if (url.pathname === "/api/download" && req.method === "GET") {
         return withSecurityHeaders(await handleDownload(url));
+      }
+      if (url.pathname === "/api/stream" && req.method === "GET") {
+        return withSecurityHeaders(await handleStream(url, req));
       }
       if (url.pathname === "/api/zip" && req.method === "POST") {
         return withSecurityHeaders(await handleZip(req));

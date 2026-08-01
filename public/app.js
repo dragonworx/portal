@@ -18,6 +18,7 @@ const els = {
   btnDownload: document.getElementById("btn-download"),
   btnCut: document.getElementById("btn-cut"),
   btnCopy: document.getElementById("btn-copy"),
+  btnSelect: document.getElementById("btn-select"),
   btnPaste: document.getElementById("btn-paste"),
   btnClipboardClear: document.getElementById("btn-clipboard-clear"),
   clipboardChip: document.getElementById("clipboard-chip"),
@@ -46,6 +47,7 @@ const els = {
   editorCancel: document.getElementById("editor-cancel"),
   // File preview (fullscreen modal).
   previewModal: document.getElementById("preview-modal"),
+  previewIcon: document.getElementById("preview-icon"),
   previewTitle: document.getElementById("preview-title"),
   previewMeta: document.getElementById("preview-meta"),
   previewBody: document.getElementById("preview-body"),
@@ -66,6 +68,9 @@ const state = {
    *  entry name we're editing; `value` mirrors the live <input> contents so
    *  the virtualised list can recreate the row mid-edit without losing it. */
   /** @type {{name:string,value:string}|null} */ editing: null,
+  /** Selection mode: row checkboxes are only shown while this is on
+   *  (toggled via the toolbar Select button). */
+  /** @type {boolean} */ selectionMode: false,
   /** Pending move/copy. `sourcePath` is the folder the items were grabbed
    *  from; `names` is a Set so we can dim source rows in the listing in O(1)
    *  while still iterating in insertion order via a parallel array. */
@@ -246,6 +251,55 @@ function filteredEntries() {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  File viewers — kinds, icons, classification                               */
+/*                                                                            */
+/*  Single source of truth linking a listing entry to (a) the viewer that   */
+/*  opens when its row is clicked and (b) the icon shown for it in the      */
+/*  file view. Kinds: "folder" (drills in), "text" (read-only CodeMirror),  */
+/*  "image" (<img> preview), "video" (<video> player), "binary" (fallback   */
+/*  panel with download). The extension sets these checks rely on live      */
+/*  with their viewers below (IMAGE_EXTS / VIDEO_EXTS in "File preview",    */
+/*  BINARY_EXTS in "Inline text editor"); they are read lazily at           */
+/*  row-render / preview-open time, never during module evaluation.         */
+/* -------------------------------------------------------------------------- */
+
+const VIEW_KINDS = {
+  folder: { icon: "folder", title: "Folder" },
+  text: { icon: "file-text", title: "Text file" },
+  image: { icon: "file-image", title: "Image" },
+  video: { icon: "file-video", title: "Video" },
+  binary: { icon: "file-binary", title: "Binary file" },
+};
+
+/** Classify an entry by the viewer that will open it. */
+function viewKindFor(entry) {
+  if (entry.type === "dir") return "folder";
+  const ext = extOf(entry.name);
+  if (IMAGE_EXTS.has(ext)) return "image";
+  if (VIDEO_EXTS.has(ext)) return "video";
+  if (BINARY_EXTS.has(ext)) return "binary";
+  return "text";
+}
+
+/** Build the SVG-mask icon element for a view kind. */
+function fileIcon(kind) {
+  const span = document.createElement("span");
+  span.className = `file-icon icon-${VIEW_KINDS[kind].icon}`;
+  span.title = VIEW_KINDS[kind].title;
+  span.setAttribute("aria-hidden", "true");
+  return span;
+}
+
+/** Build the SVG-mask icon span for a row-action button (the button's
+ *  `action-*` class picks the glyph via CSS). */
+function rowActionIcon() {
+  const span = document.createElement("span");
+  span.className = "icon";
+  span.setAttribute("aria-hidden", "true");
+  return span;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Virtualised list rendering                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -257,6 +311,10 @@ function renderList() {
 }
 
 function renderVisible() {
+  // Rows are recreated below, so any open "⋯" menu would be left anchored
+  // to a detached button — close it (also covers scroll and window resize,
+  // which both route through here).
+  closeRowMenu();
   const list = filteredEntries();
   const scrollTop = els.viewport.scrollTop;
   const height = els.viewport.clientHeight;
@@ -334,6 +392,7 @@ function buildRow(entry, index) {
 
   const name = document.createElement("div");
   name.className = "cell cell-name";
+  name.appendChild(fileIcon(viewKindFor(entry)));
 
   if (isEditing) {
     const input = document.createElement("input");
@@ -386,52 +445,37 @@ function buildRow(entry, index) {
 
   const actions = document.createElement("div");
   actions.className = "cell cell-actions";
-  // Edit-content button (text files): opens the fullscreen editor. We show
-  // it on every file regardless of extension — the editor itself warns when
-  // the file looks binary. Hiding it for directories keeps the UI clean.
-  if (entry.type === "file") {
-    const openBtn = document.createElement("button");
-    openBtn.type = "button";
-    openBtn.className = "row-action";
-    openBtn.title = "Edit text";
-    openBtn.setAttribute("aria-label", `Edit ${entry.name}`);
-    openBtn.textContent = "📝";
-    openBtn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      openEditor(entry);
-    });
-    actions.append(openBtn);
-  }
-  const editBtn = document.createElement("button");
-  editBtn.type = "button";
-  editBtn.className = "row-action";
-  editBtn.title = "Rename";
-  editBtn.setAttribute("aria-label", `Rename ${entry.name}`);
-  editBtn.textContent = "✎";
-  editBtn.addEventListener("click", (ev) => {
+  // Single "⋯" overflow button: opens a floating menu with the row actions
+  // (edit / rename / delete). One button instead of three saves horizontal
+  // space, and the menu is viewport-aware so it never renders off-screen
+  // (see openRowMenu).
+  const moreBtn = document.createElement("button");
+  moreBtn.type = "button";
+  moreBtn.className = "row-action action-more";
+  moreBtn.title = "Actions";
+  moreBtn.setAttribute("aria-label", `Actions for ${entry.name}`);
+  moreBtn.setAttribute("aria-haspopup", "menu");
+  moreBtn.setAttribute("aria-expanded", "false");
+  moreBtn.appendChild(rowActionIcon());
+  moreBtn.addEventListener("click", (ev) => {
     ev.stopPropagation();
-    beginRename(entry);
+    toggleRowMenu(moreBtn, entry, row);
   });
-  const delBtn = document.createElement("button");
-  delBtn.type = "button";
-  delBtn.className = "row-action danger";
-  delBtn.title = "Delete";
-  delBtn.setAttribute("aria-label", `Delete ${entry.name}`);
-  delBtn.textContent = "🗑";
-  delBtn.addEventListener("click", (ev) => {
-    ev.stopPropagation();
-    deleteEntry(entry);
-  });
-  actions.append(editBtn, delBtn);
+  actions.append(moreBtn);
 
   row.append(check, name, size, mtime, actions);
 
-  // Single click on a dir drills in; on a file it opens the preview. Use
-  // the checkbox to select files. While a cut/copy is pending, file rows
-  // are inert (no checkbox, no preview).
+  // Single click on a dir drills in; on a file it opens the preview. In
+  // select mode a tap instead toggles the row's checkbox — opening entries
+  // would surprise users who are trying to build a selection. While a
+  // cut/copy is pending, file rows are inert (no checkbox, no preview).
   row.addEventListener("click", (ev) => {
     if (selector && ev.target === selector) return;
     if (isEditing) return;
+    if (state.selectionMode && !inClipboardMode) {
+      toggleSelect(entry.name, !state.selected.has(entry.name));
+      return;
+    }
     if (entry.type === "dir") {
       const next = state.path ? `${state.path}/${entry.name}` : entry.name;
       loadPath(next);
@@ -441,6 +485,168 @@ function buildRow(entry, index) {
   });
 
   return row;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Row actions overflow menu ("⋯")                                           */
+/*                                                                            */
+/*  A single floating menu per row replaces the inline edit/rename/delete    */
+/*  buttons. The menu is appended to <body> and positioned with fixed        */
+/*  coordinates so it never gets clipped by the virtualised list's overflow; */
+/*  placement flips above the anchor when there isn't room below and clamps  */
+/*  to the viewport, so the menu is always fully visible.                    */
+/* -------------------------------------------------------------------------- */
+
+/** @type {{el:HTMLElement,anchor:HTMLButtonElement,row:HTMLElement}|null} */
+let rowMenu = null;
+
+function closeRowMenu() {
+  if (!rowMenu) return;
+  rowMenu.el.remove();
+  rowMenu.anchor.setAttribute("aria-expanded", "false");
+  rowMenu.row.classList.remove("menu-open");
+  rowMenu = null;
+  document.removeEventListener("pointerdown", onRowMenuPointerDown, true);
+}
+
+function onRowMenuPointerDown(ev) {
+  // The anchor's own click handler toggles the menu — ignore it here so the
+  // sequence isn't close-on-pointerdown + reopen-on-click.
+  if (rowMenu && !rowMenu.el.contains(ev.target) && !rowMenu.anchor.contains(ev.target)) {
+    closeRowMenu();
+  }
+}
+
+function toggleRowMenu(anchor, entry, row) {
+  if (rowMenu && rowMenu.anchor === anchor) {
+    closeRowMenu();
+    return;
+  }
+  closeRowMenu();
+  openRowMenu(anchor, entry, row);
+}
+
+function openRowMenu(anchor, entry, row) {
+  const menu = document.createElement("div");
+  menu.className = "row-menu";
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", `Actions for ${entry.name}`);
+
+  const items = [];
+  const addItem = (className, label, onPick) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = `row-menu-item ${className}`;
+    item.setAttribute("role", "menuitem");
+    item.appendChild(rowActionIcon());
+    const text = document.createElement("span");
+    text.textContent = label;
+    item.appendChild(text);
+    item.addEventListener("click", () => {
+      closeRowMenu();
+      onPick();
+    });
+    menu.appendChild(item);
+    items.push(item);
+  };
+
+  // Edit-content (text files): opens the fullscreen editor. Shown on every
+  // file regardless of extension — the editor itself warns when the file
+  // looks binary. Hidden for directories to keep the menu clean.
+  if (entry.type === "file") {
+    addItem("action-edit", "Edit", () => openEditor(entry));
+  }
+  addItem("action-rename", "Rename", () => beginRename(entry));
+  addItem("action-delete danger", "Delete", () => deleteEntry(entry));
+
+  // Menu keyboard navigation (roving focus between items).
+  menu.addEventListener("keydown", (ev) => {
+    const idx = items.indexOf(document.activeElement);
+    if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      items[(idx + 1) % items.length].focus();
+    } else if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      items[(idx - 1 + items.length) % items.length].focus();
+    } else if (ev.key === "Home") {
+      ev.preventDefault();
+      items[0].focus();
+    } else if (ev.key === "End") {
+      ev.preventDefault();
+      items[items.length - 1].focus();
+    } else if (ev.key === "Escape") {
+      // stopPropagation so the global Escape handler (clipboard clear)
+      // doesn't also fire.
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeRowMenu();
+      anchor.focus();
+    } else if (ev.key === "Tab") {
+      closeRowMenu();
+    }
+  });
+
+  document.body.appendChild(menu);
+  positionRowMenu(menu, anchor);
+
+  rowMenu = { el: menu, anchor, row };
+  anchor.setAttribute("aria-expanded", "true");
+  // Keep the row's actions cell visible while the menu is open — the pointer
+  // is over the menu (in <body>), so plain :hover/:focus-within would hide it.
+  row.classList.add("menu-open");
+  items[0].focus();
+
+  document.addEventListener("pointerdown", onRowMenuPointerDown, true);
+}
+
+/** Place the menu next to its anchor, flipping vertically and clamping both
+ *  axes so it always stays fully inside the viewport. */
+function positionRowMenu(menu, anchor) {
+  const GAP = 4;
+  const MARGIN = 8;
+  const rect = anchor.getBoundingClientRect();
+  const menuH = menu.offsetHeight;
+  const menuW = menu.offsetWidth;
+
+  // Vertical: prefer opening below the anchor; flip above when there isn't
+  // enough room, then clamp as a last resort (tiny viewports).
+  let top = rect.bottom + GAP;
+  if (
+    top + menuH > window.innerHeight - MARGIN &&
+    rect.top - GAP - menuH >= MARGIN
+  ) {
+    top = rect.top - GAP - menuH;
+  }
+  top = Math.max(MARGIN, Math.min(top, window.innerHeight - menuH - MARGIN));
+
+  // Horizontal: right-align with the anchor, clamped into view.
+  let left = Math.min(rect.right - menuW, window.innerWidth - menuW - MARGIN);
+  left = Math.max(MARGIN, left);
+
+  menu.style.top = `${top}px`;
+  menu.style.left = `${left}px`;
+}
+
+/** Toggle selection mode: shows/hides the per-row checkboxes. Turning it
+ *  on highlights the toolbar button and slides the checkboxes in; turning
+ *  it off clears the current selection. */
+function setSelectionMode(on) {
+  if (state.selectionMode === on) return;
+  state.selectionMode = on;
+  document.body.classList.toggle("select-mode", on);
+  els.btnSelect.classList.toggle("active", on);
+  els.btnSelect.setAttribute("aria-pressed", String(on));
+  if (on) {
+    // Animate the checkboxes sliding in — the class self-removes after the
+    // animation so rows recreated later (scrolling the virtualised list)
+    // don't re-trigger it.
+    document.body.classList.add("select-anim");
+    setTimeout(() => document.body.classList.remove("select-anim"), 300);
+  } else if (state.selected.size > 0) {
+    state.selected.clear();
+    renderSelection();
+  }
+  renderVisible();
 }
 
 function toggleSelect(name, selected) {
@@ -1021,7 +1227,16 @@ els.btnRefresh.addEventListener("click", () => loadPath(state.path));
 
 els.btnDownload.addEventListener("click", downloadSelection);
 els.btnCut.addEventListener("click", () => setClipboard("move"));
-els.btnCopy.addEventListener("click", () => setClipboard("copy"));
+els.btnCopy.addEventListener("click", () => {
+  // In selection mode also put a plain-text list of the selected filenames
+  // (names only, no paths) on the system clipboard, one per line. Must run
+  // before setClipboard(), which clears the selection.
+  if (state.selectionMode && state.selected.size > 0) {
+    navigator.clipboard.writeText(Array.from(state.selected).join("\n")).catch(() => {});
+  }
+  setClipboard("copy");
+});
+els.btnSelect.addEventListener("click", () => setSelectionMode(!state.selectionMode));
 els.btnPaste.addEventListener("click", pasteHere);
 els.btnClipboardClear.addEventListener("click", clearClipboard);
 
@@ -1532,6 +1747,12 @@ const IMAGE_MIME = {
   avif: "image/avif",
 };
 
+/** Extensions we hand to the <video> player. Formats the browser can't
+ *  decode (e.g. some MKV codecs) fail gracefully in the player with an
+ *  error note pointing at the Download button. Must stay in sync with
+ *  STREAM_VIDEO_MIME in src/server.ts (the /api/stream allowlist). */
+const VIDEO_EXTS = new Set(["mp4", "m4v", "webm", "mov", "ogv", "mkv"]);
+
 const previewState = {
   /** Relative path being previewed, or null when the preview is closed. */
   path: null,
@@ -1546,6 +1767,11 @@ async function openPreview(entry) {
   const fullPath = joinPath(entry.name);
   previewState.path = fullPath;
 
+  // Classify once via the shared viewer registry: this decides both the
+  // header icon and which viewer renders the body, so they can't disagree.
+  const kind = viewKindFor(entry);
+  els.previewIcon.replaceChildren(fileIcon(kind));
+
   els.previewTitle.textContent = "/" + fullPath;
   els.previewTitle.title = "/" + fullPath;
   els.previewMeta.textContent = "loading…";
@@ -1555,8 +1781,10 @@ async function openPreview(entry) {
 
   const ext = extOf(entry.name);
   try {
-    if (IMAGE_EXTS.has(ext)) {
+    if (kind === "image") {
       await showImagePreview(fullPath, entry, ext);
+    } else if (kind === "video") {
+      await showVideoPreview(fullPath, entry, ext);
     } else {
       await showTextPreview(fullPath, entry);
     }
@@ -1615,6 +1843,159 @@ async function showImagePreview(fullPath, entry, ext) {
   previewState.objectUrl = objectUrl;
   els.previewMeta.textContent = meta;
   els.previewBody.replaceChildren(img);
+}
+
+/** Format a playback position as m:ss (or h:mm:ss for long videos). */
+function fmtDuration(sec) {
+  if (!isFinite(sec) || sec < 0) return "0:00";
+  const s = Math.floor(sec);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const ss = String(s % 60).padStart(2, "0");
+  if (h) return `${h}:${String(m % 60).padStart(2, "0")}:${ss}`;
+  return `${m}:${ss}`;
+}
+
+async function showVideoPreview(fullPath, entry, ext) {
+  // Stream straight from /api/stream instead of buffering a Blob like the
+  // image preview does: the player issues range requests for metadata and
+  // seeks, so the whole movie never sits in memory — essential on mobile.
+  const wrap = document.createElement("div");
+  wrap.className = "preview-video-wrap";
+
+  const video = document.createElement("video");
+  video.className = "preview-video";
+  // playsinline keeps playback inside the modal on iOS instead of hijacking
+  // into the system player; metadata-only preload keeps the modal snappy.
+  video.playsInline = true;
+  video.setAttribute("webkit-playsinline", "");
+  video.preload = "metadata";
+  video.src = `/api/stream?path=${encodeURIComponent(fullPath)}`;
+
+  const meta = await new Promise((resolve, reject) => {
+    video.addEventListener("loadedmetadata", () => {
+      const dims =
+        video.videoWidth && video.videoHeight
+          ? ` • ${video.videoWidth} × ${video.videoHeight}`
+          : "";
+      resolve(
+        `${ext.toUpperCase()}${dims} • ${fmtDuration(video.duration)}` +
+          ` • ${fmtSize(entry.size)}`,
+      );
+    });
+    video.addEventListener("error", () =>
+      reject(
+        new Error("this video format cannot be decoded by the browser"),
+      ),
+    );
+  });
+
+  if (previewState.path !== fullPath) return;
+
+  // Custom control bar. Native `controls` are tiny and inconsistent across
+  // mobile browsers, so we build our own with large touch targets: play /
+  // pause, position, seek, mute, fullscreen.
+  const controls = document.createElement("div");
+  controls.className = "video-controls";
+
+  const playBtn = document.createElement("button");
+  playBtn.type = "button";
+  playBtn.className = "video-btn";
+  const playIcon = document.createElement("span");
+  playIcon.className = "icon icon-play";
+  playIcon.setAttribute("aria-hidden", "true");
+  playBtn.append(playIcon);
+  playBtn.setAttribute("aria-label", "Play");
+
+  const time = document.createElement("span");
+  time.className = "video-time";
+  time.textContent = `0:00 / ${fmtDuration(video.duration)}`;
+
+  const seek = document.createElement("input");
+  seek.type = "range";
+  seek.className = "video-seek";
+  seek.min = "0";
+  seek.max = "1000";
+  seek.value = "0";
+  seek.step = "1";
+  seek.setAttribute("aria-label", "Seek");
+
+  const muteBtn = document.createElement("button");
+  muteBtn.type = "button";
+  muteBtn.className = "video-btn";
+  const muteIcon = document.createElement("span");
+  muteIcon.className = "icon icon-sound-on";
+  muteIcon.setAttribute("aria-hidden", "true");
+  muteBtn.append(muteIcon);
+  muteBtn.setAttribute("aria-label", "Mute");
+
+  const fsBtn = document.createElement("button");
+  fsBtn.type = "button";
+  fsBtn.className = "video-btn";
+  fsBtn.textContent = "⛶";
+  fsBtn.setAttribute("aria-label", "Fullscreen");
+
+  controls.append(playBtn, time, seek, muteBtn, fsBtn);
+  wrap.append(video, controls);
+
+  const syncPlayBtn = () => {
+    playIcon.classList.toggle("icon-play", video.paused);
+    playIcon.classList.toggle("icon-pause", !video.paused);
+    playBtn.setAttribute("aria-label", video.paused ? "Play" : "Pause");
+  };
+  const togglePlay = () => {
+    if (video.paused) video.play().catch(() => {});
+    else video.pause();
+  };
+  playBtn.addEventListener("click", togglePlay);
+  video.addEventListener("click", togglePlay);
+  video.addEventListener("play", syncPlayBtn);
+  video.addEventListener("pause", syncPlayBtn);
+
+  // Don't fight the user's drag: only move the slider from playback events
+  // while they aren't holding it.
+  let seekDragging = false;
+  video.addEventListener("timeupdate", () => {
+    if (!seekDragging && video.duration) {
+      seek.value = String(
+        Math.round((video.currentTime / video.duration) * 1000),
+      );
+    }
+    time.textContent =
+      `${fmtDuration(video.currentTime)} / ${fmtDuration(video.duration)}`;
+  });
+  seek.addEventListener("input", () => {
+    seekDragging = true;
+    if (video.duration) {
+      video.currentTime = (Number(seek.value) / 1000) * video.duration;
+    }
+  });
+  seek.addEventListener("change", () => {
+    seekDragging = false;
+  });
+
+  // A mute toggle rather than a volume slider: on iOS the volume is
+  // hardware-only and slider changes are ignored.
+  muteBtn.addEventListener("click", () => {
+    video.muted = !video.muted;
+    muteIcon.classList.toggle("icon-sound-on", !video.muted);
+    muteIcon.classList.toggle("icon-sound-off", video.muted);
+    muteBtn.setAttribute("aria-label", video.muted ? "Unmute" : "Mute");
+  });
+
+  fsBtn.addEventListener("click", () => {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else if (wrap.requestFullscreen) {
+      wrap.requestFullscreen().catch(() => {});
+    } else if (video.webkitEnterFullscreen) {
+      // iOS Safari: only the video element itself can go fullscreen.
+      video.webkitEnterFullscreen();
+    }
+  });
+
+  els.previewMeta.textContent = meta;
+  els.previewBody.replaceChildren(wrap);
 }
 
 async function showTextPreview(fullPath, entry) {
@@ -1694,6 +2075,10 @@ function previewNote(icon, message, detail) {
 
 function closePreview() {
   if (!previewState.path) return;
+  // Pause any playing video first — a detached <video> can keep playing
+  // audio after its DOM is dropped.
+  const video = els.previewBody.querySelector("video");
+  if (video) video.pause();
   els.previewModal.hidden = true;
   document.body.classList.remove("preview-open");
   if (previewState.objectUrl) {

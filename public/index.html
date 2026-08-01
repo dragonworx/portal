@@ -21,6 +21,10 @@
       <div class="brand">
         <span class="logo" aria-hidden="true">▣</span>
         <span class="brand-name">Portal</span>
+        <div class="status" id="status" title="Server connection">
+          <span class="dot" id="status-dot"></span>
+          <span class="status-text" id="status-text">connecting…</span>
+        </div>
       </div>
 
       <nav class="crumbs" id="crumbs" aria-label="Folder breadcrumbs"></nav>
@@ -36,10 +40,6 @@
       </div>
 
       <div class="topbar-right">
-        <div class="status" id="status" title="Server connection">
-          <span class="dot" id="status-dot"></span>
-          <span class="status-text" id="status-text">connecting…</span>
-        </div>
         <div class="user" id="user" hidden>
           <span class="user-email" id="user-email" title=""></span>
           <a
@@ -60,29 +60,34 @@
         <button id="btn-refresh" class="btn ghost" title="Refresh listing" aria-label="Refresh">
           <span class="icon" aria-hidden="true"></span><span class="btn-label">Refresh</span>
         </button>
-        <button id="btn-newfolder" class="btn ghost" title="New folder" aria-label="New folder">
-          <span class="icon" aria-hidden="true"></span><span class="btn-label">New folder</span>
-        </button>
+        <span class="toolbar-sep" aria-hidden="true"></span>
         <button id="btn-newfile" class="btn ghost" title="New file" aria-label="New file">
           <span class="icon" aria-hidden="true"></span><span class="btn-label">New file</span>
+        </button>
+        <button id="btn-newfolder" class="btn ghost" title="New folder" aria-label="New folder">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">New folder</span>
         </button>
         <label class="btn ghost upload-label" title="Upload files" aria-label="Upload files">
           <span class="icon" aria-hidden="true"></span><span class="btn-label">Upload</span>
           <input id="file-input" type="file" multiple hidden />
         </label>
-      </div>
-
-      <div class="toolbar-right">
-        <span id="selection-summary" class="muted">No items selected</span>
-        <button id="btn-cut" class="btn ghost" disabled title="Cut (⌘/Ctrl+X)" aria-label="Cut">
-          <span class="icon" aria-hidden="true"></span><span class="btn-label">Cut</span>
+        <span class="toolbar-sep" aria-hidden="true"></span>
+        <button id="btn-select" class="btn ghost" title="Toggle selection mode" aria-label="Select" aria-pressed="false">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">Select</span>
         </button>
         <button id="btn-copy" class="btn ghost" disabled title="Copy (⌘/Ctrl+C)" aria-label="Copy">
           <span class="icon" aria-hidden="true"></span><span class="btn-label">Copy</span>
         </button>
+        <button id="btn-cut" class="btn ghost" disabled title="Cut (⌘/Ctrl+X)" aria-label="Cut">
+          <span class="icon" aria-hidden="true"></span><span class="btn-label">Cut</span>
+        </button>
         <button id="btn-download" class="btn primary" disabled title="Download selected" aria-label="Download">
           <span class="icon" aria-hidden="true"></span><span class="btn-label">Download</span>
         </button>
+      </div>
+
+      <div class="toolbar-right">
+        <span id="selection-summary" class="muted">No items selected</span>
       </div>
     </section>
 
@@ -121,7 +126,7 @@
     <aside class="uploads" id="uploads" hidden>
       <header class="uploads-header">
         <span>Uploads</span>
-        <button id="uploads-clear" class="btn tiny ghost">Clear done</button>
+        <button id="uploads-clear" class="btn tiny ghost">Close</button>
       </header>
       <ul id="uploads-list"></ul>
     </aside>
@@ -195,7 +200,9 @@
             </div>
           </div>
           <div class="editor-actions">
-            <button id="preview-download" class="btn ghost" type="button">Download</button>
+            <button id="preview-download" class="btn ghost icon-btn" type="button" title="Download" aria-label="Download">
+              <span class="icon" aria-hidden="true"></span>
+            </button>
             <button id="preview-close" class="btn primary" type="button">Close</button>
           </div>
         </header>
