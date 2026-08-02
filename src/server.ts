@@ -1,5 +1,11 @@
 import { stat, readdir, mkdir, rm, rename, cp, writeFile } from "node:fs/promises";
-import { createWriteStream, constants as fsConstants, openSync } from "node:fs";
+import {
+  createWriteStream,
+  constants as fsConstants,
+  openSync,
+  watch,
+  type FSWatcher,
+} from "node:fs";
 import { Readable } from "node:stream";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
@@ -278,6 +284,11 @@ const RATE_LIMIT_MAX_BUCKETS = 10_000;
 
 const apiBuckets = new Map<string, Bucket>();
 const authBuckets = new Map<string, Bucket>();
+/** Separate bucket for /api/events: one long-lived stream per open folder,
+ *  plus a reconnect whenever the user navigates, so the shape of the traffic
+ *  is nothing like the rest of the API. Sharing `apiBuckets` would let a
+ *  reconnect storm after a restart 429 every client into a retry loop. */
+const eventBuckets = new Map<string, Bucket>();
 
 /**
  * Token bucket. `capacity` is the burst size; `refillPerSec` is the
@@ -322,7 +333,7 @@ const RATE_LIMIT_GC_INTERVAL_MS = 5 * 60 * 1000;
 const RATE_LIMIT_IDLE_MS = 30 * 60 * 1000;
 setInterval(() => {
   const cutoff = Date.now() - RATE_LIMIT_IDLE_MS;
-  for (const map of [apiBuckets, authBuckets]) {
+  for (const map of [apiBuckets, authBuckets, eventBuckets]) {
     for (const [k, v] of map) {
       if (v.lastRefill < cutoff) map.delete(k);
     }
@@ -371,6 +382,194 @@ async function handleList(url: URL): Promise<Response> {
   return json({
     path: toRelative(config.root, target),
     entries,
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Live directory watching (SSE)                                             */
+/*                                                                            */
+/*  The client holds one EventSource open on the folder it is displaying and  */
+/*  re-lists when we tell it that folder changed. We deliberately push a bare */
+/*  "dirty" signal rather than the new listing or a diff:                     */
+/*                                                                            */
+/*    * inotify coalesces. A create+delete of the same name inside one tick   */
+/*      arrives as a single event, so events cannot be replayed as a          */
+/*      changelog without drifting out of sync. Re-reading /api/list can't.   */
+/*    * The listing is only built when somebody is actually watching, and     */
+/*      only once per burst.                                                  */
+/*                                                                            */
+/*  Watches are non-recursive and refcounted per directory, so the kernel     */
+/*  holds one inotify watch per folder currently open in a browser rather     */
+/*  than one per folder in the tree — a node_modules dropped into the root    */
+/*  can't exhaust fs.inotify.max_user_watches.                                */
+/* -------------------------------------------------------------------------- */
+
+/** Quiet period before a burst of filesystem events becomes one signal. */
+const WATCH_DEBOUNCE_MS = 150;
+/** ...but never stay silent longer than this. Without a ceiling, a sustained
+ *  write (a large upload landing file by file) would reset the debounce
+ *  forever and the listing would not move until it finished. */
+const WATCH_MAX_COALESCE_MS = 1_000;
+/** Keep-alive cadence. Must stay well under the `idleTimeout` passed to
+ *  Bun.serve or idle streams are dropped mid-flight. It doubles as the
+ *  reaper for sockets that died without delivering a cancel(): the enqueue
+ *  throws, and we tear the subscription down from there. */
+const SSE_HEARTBEAT_MS = 5_000;
+/** Ceiling on distinct watched directories — one per folder open in a
+ *  browser, so far above real usage. It exists so a misbehaving client
+ *  cannot exhaust our file descriptors. */
+const MAX_WATCHED_DIRS = 256;
+
+const SSE_DIRTY_FRAME = "event: dirty\ndata: {}\n\n";
+
+interface WatchEntry {
+  watcher: FSWatcher;
+  subscribers: Set<() => void>;
+  timer: ReturnType<typeof setTimeout> | null;
+  /** When the current coalescing window opened (null when idle). */
+  burstStartedAt: number | null;
+}
+
+/** Keyed by realpath-resolved absolute directory. */
+const watchedDirs = new Map<string, WatchEntry>();
+
+function closeWatch(absDir: string): void {
+  const entry = watchedDirs.get(absDir);
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  watchedDirs.delete(absDir);
+  try {
+    entry.watcher.close();
+  } catch {
+    /* already closed */
+  }
+}
+
+/**
+ * Watch `absDir` (non-recursively) and call `onDirty` when its contents
+ * change, sharing one FSWatcher across every subscriber to that directory.
+ * Returns the unsubscribe function; the watcher is closed when the last
+ * subscriber leaves.
+ */
+function subscribeToDir(absDir: string, onDirty: () => void): () => void {
+  let entry = watchedDirs.get(absDir);
+  if (!entry) {
+    if (watchedDirs.size >= MAX_WATCHED_DIRS) {
+      throw new PathError("Too many watched folders", 503);
+    }
+    const created: WatchEntry = {
+      // persistent:false — the watcher must not be a reason for the process
+      // to stay alive; Bun.serve owns the event loop.
+      watcher: watch(absDir, { persistent: false }),
+      subscribers: new Set(),
+      timer: null,
+      burstStartedAt: null,
+    };
+    const fire = () => {
+      created.timer = null;
+      created.burstStartedAt = null;
+      for (const fn of [...created.subscribers]) fn();
+    };
+    created.watcher.on("change", () => {
+      const now = Date.now();
+      if (created.burstStartedAt === null) created.burstStartedAt = now;
+      if (created.timer) clearTimeout(created.timer);
+      const untilCeiling = created.burstStartedAt + WATCH_MAX_COALESCE_MS - now;
+      created.timer = setTimeout(fire, Math.max(0, Math.min(WATCH_DEBOUNCE_MS, untilCeiling)));
+    });
+    created.watcher.on("error", () => {
+      // Typically the directory itself was deleted or moved. Wake the
+      // subscribers so they re-list (and discover the 404) before we drop
+      // the dead watcher.
+      const subs = [...created.subscribers];
+      closeWatch(absDir);
+      for (const fn of subs) fn();
+    });
+    watchedDirs.set(absDir, created);
+    entry = created;
+  }
+
+  const mine = entry;
+  mine.subscribers.add(onDirty);
+  return () => {
+    // Guard against unsubscribing into a watcher that was already torn down
+    // and replaced (error path above) — that Set is no longer the live one.
+    if (watchedDirs.get(absDir) !== mine) return;
+    mine.subscribers.delete(onDirty);
+    if (mine.subscribers.size === 0) closeWatch(absDir);
+  };
+}
+
+async function handleEvents(url: URL, req: Request): Promise<Response> {
+  const requested = url.searchParams.get("path") ?? "";
+  const target = safeResolve(config.root, requested, true);
+  const st = await stat(target);
+  if (!st.isDirectory()) {
+    throw new PathError("Not a directory", 400);
+  }
+
+  const encoder = new TextEncoder();
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  let unsubscribe: () => void = () => {};
+  let pendingDirty = false;
+  let closed = false;
+
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = null;
+    unsubscribe();
+    req.signal.removeEventListener("abort", cleanup);
+  };
+
+  const send = (chunk: string) => {
+    if (closed || !controller) return;
+    try {
+      controller.enqueue(encoder.encode(chunk));
+    } catch {
+      // The socket went away without a cancel() — stop watching.
+      cleanup();
+    }
+  };
+
+  // Subscribe before the Response is built so a failure (fd exhaustion, the
+  // directory vanishing between stat() and watch()) surfaces as an ordinary
+  // error response rather than a stream that dies after headers are sent.
+  unsubscribe = subscribeToDir(target, () => {
+    if (controller) send(SSE_DIRTY_FRAME);
+    else pendingDirty = true;
+  });
+  req.signal.addEventListener("abort", cleanup);
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+      // Reconnect backoff for this stream, in ms — the browser applies it
+      // automatically on every drop.
+      send("retry: 2000\n\n");
+      send("event: ready\ndata: {}\n\n");
+      if (pendingDirty) {
+        pendingDirty = false;
+        send(SSE_DIRTY_FRAME);
+      }
+      heartbeat = setInterval(() => send(": keep-alive\n\n"), SSE_HEARTBEAT_MS);
+    },
+    cancel() {
+      cleanup();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      // no-transform asks intermediaries not to buffer the stream in order
+      // to compress it (this deployment fronts Bun with Caddy's `encode`);
+      // x-accel-buffering is the nginx spelling of the same request.
+      "cache-control": "private, no-cache, no-store, no-transform",
+      "x-accel-buffering": "no",
+    },
   });
 }
 
@@ -1286,6 +1485,10 @@ Bun.serve({
   // readJsonLimited so a missing Content-Length can't be used to balloon
   // memory on JSON endpoints.
   maxRequestBodySize: config.maxUploadBytes,
+  // Bun defaults to 10s and applies it to streaming responses too, which
+  // would cut /api/events off between heartbeats. 30s leaves a 6x margin
+  // over SSE_HEARTBEAT_MS while still reaping genuinely dead connections.
+  idleTimeout: 30,
   async fetch(req, server) {
     const url = new URL(req.url);
     const cookies = parseCookies(req.headers.get("cookie"));
@@ -1304,8 +1507,25 @@ Bun.serve({
       // Broader bucket on the API surface — generous enough not to bother
       // legitimate clients (the UI does dozens of requests per minute) but
       // closes the door on naive abuse.
-      if (url.pathname.startsWith("/api/") && url.pathname !== "/api/ping") {
+      if (
+        url.pathname.startsWith("/api/") &&
+        url.pathname !== "/api/ping" &&
+        url.pathname !== "/api/events"
+      ) {
         if (!consumeToken(apiBuckets, ip, 120, 20)) {
+          return withSecurityHeaders(rateLimitResponse());
+        }
+      }
+      // /api/events opens one long-lived stream per folder being viewed and
+      // reconnects on navigation, so it gets its own allowance. It's set
+      // generously because a stream is cheap to hold and because a 429 is
+      // expensive on this route: an HTTP error status closes an EventSource
+      // permanently, so every rate-limited client has to be rescued by the
+      // manual reconnect path rather than the browser's own retry. Note the
+      // bucket is per socket peer, which behind a reverse proxy means every
+      // user shares one — as with apiBuckets above.
+      if (url.pathname === "/api/events") {
+        if (!consumeToken(eventBuckets, ip, 120, 4)) {
           return withSecurityHeaders(rateLimitResponse());
         }
       }
@@ -1376,6 +1596,9 @@ Bun.serve({
       }
       if (url.pathname === "/api/list" && req.method === "GET") {
         return withSecurityHeaders(await handleList(url));
+      }
+      if (url.pathname === "/api/events" && req.method === "GET") {
+        return withSecurityHeaders(await handleEvents(url, req));
       }
       if (url.pathname === "/api/download" && req.method === "GET") {
         return withSecurityHeaders(await handleDownload(url));

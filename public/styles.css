@@ -125,6 +125,7 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .crumb-sep { color: var(--text-dim); padding: 0 2px; }
 
 .topbar-right { display: flex; gap: 12px; align-items: center; }
+.search { position: relative; display: flex; align-items: center; }
 .search input {
   background: var(--bg-row);
   border: 1px solid var(--border);
@@ -136,10 +137,35 @@ input[type="checkbox"] { accent-color: var(--accent); }
   font-family: inherit;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
+.search input.has-value { padding-right: 28px; }
+/* Hide the native webkit clear icon; we render our own for consistency. */
+.search input::-webkit-search-cancel-button { display: none; }
 .search input::placeholder { color: var(--text-dim); }
 .search input:focus {
   border-color: var(--accent);
   box-shadow: var(--glow-accent);
+}
+.search-clear {
+  position: absolute;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.search-clear:hover {
+  color: var(--text);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
 }
 
 .status {
@@ -237,7 +263,6 @@ input[type="checkbox"] { accent-color: var(--accent); }
   mask: var(--icon) center / contain no-repeat;
 }
 #btn-up .icon { --icon: url("/up.svg"); }
-#btn-refresh .icon { --icon: url("/refresh.svg"); }
 #btn-newfolder .icon { --icon: url("/create-folder.svg"); }
 #btn-newfile .icon { --icon: url("/create-file.svg"); }
 .upload-label .icon { --icon: url("/upload.svg"); }

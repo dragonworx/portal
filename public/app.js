@@ -4,6 +4,7 @@
 const els = {
   crumbs: document.getElementById("crumbs"),
   filter: document.getElementById("filter"),
+  filterClear: document.getElementById("filter-clear"),
   statusBox: document.getElementById("status"),
   statusText: document.getElementById("status-text"),
   selectAll: document.getElementById("select-all"),
@@ -12,7 +13,6 @@ const els = {
   rows: document.getElementById("rows"),
   empty: document.getElementById("empty"),
   btnUp: document.getElementById("btn-up"),
-  btnRefresh: document.getElementById("btn-refresh"),
   btnNewFolder: document.getElementById("btn-newfolder"),
   btnNewFile: document.getElementById("btn-newfile"),
   btnDownload: document.getElementById("btn-download"),
@@ -298,7 +298,12 @@ async function api(path, opts) {
     } catch {
       /* ignore */
     }
-    throw new Error(msg);
+    const err = new Error(msg);
+    // Callers that need to branch on the failure (e.g. the live refresh
+    // treating 404 as "this folder is gone") read this rather than sniffing
+    // the message text.
+    err.status = res.status;
+    throw err;
   }
   return res;
 }
@@ -323,15 +328,6 @@ async function loadMe() {
   }
 }
 
-async function ping() {
-  try {
-    const res = await fetch("/api/ping", { cache: "no-store" });
-    setConnected(res.ok);
-  } catch {
-    setConnected(false);
-  }
-}
-
 function setConnected(ok) {
   if (state.connected === ok) return;
   state.connected = ok;
@@ -345,6 +341,9 @@ function setConnected(ok) {
 /* -------------------------------------------------------------------------- */
 
 async function loadPath(path) {
+  // A retry may be pending against the folder we were last on; this call
+  // supersedes it.
+  cancelReload();
   try {
     const res = await api(`/api/list?path=${encodeURIComponent(path)}`);
     const data = await res.json();
@@ -354,6 +353,7 @@ async function loadPath(path) {
     state.editing = null;
     els.filter.value = "";
     state.filter = "";
+    updateFilterClear();
     renderCrumbs();
     renderList();
     renderSelection();
@@ -364,10 +364,247 @@ async function loadPath(path) {
     if (location.hash !== target && !(state.path === "" && location.hash === "")) {
       history.replaceState(null, "", target);
     }
+    watchPath(state.path);
+    reloadDelay = RELOAD_BASE_MS;
+    loadErrorShown = false;
   } catch (err) {
     setConnected(false);
-    uiAlert(`Failed to load: ${err.message}`, "Could not load folder");
+    // There is no Refresh button to fall back on any more, so a failed load
+    // must not be a dead end: keep retrying quietly in the background until
+    // the server answers. The alert is shown once per outage rather than on
+    // every attempt.
+    if (!loadErrorShown) {
+      loadErrorShown = true;
+      uiAlert(`Failed to load: ${err.message}`, "Could not load folder");
+    }
+    if (err.message !== "unauthorized") scheduleReload(path);
   }
+}
+
+const RELOAD_BASE_MS = 2000;
+let reloadTimer = null;
+let reloadDelay = RELOAD_BASE_MS;
+let loadErrorShown = false;
+
+function cancelReload() {
+  if (reloadTimer !== null) {
+    clearTimeout(reloadTimer);
+    reloadTimer = null;
+  }
+}
+
+function scheduleReload(path) {
+  if (reloadTimer !== null) return;
+  reloadTimer = setTimeout(() => {
+    reloadTimer = null;
+    loadPath(path);
+  }, reloadDelay);
+  reloadDelay = Math.min(reloadDelay * 2, LIVE_RETRY_MAX_MS);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Live updates                                                              */
+/*                                                                            */
+/*  The server watches whichever folder we're displaying and pushes a bare    */
+/*  "dirty" event over SSE when it changes; we re-list in response. The       */
+/*  signal carries no data — /api/list stays the single source of truth —     */
+/*  because filesystem events coalesce and can't be replayed as a diff        */
+/*  without drifting.                                                         */
+/*                                                                            */
+/*  The stream doubles as the connection indicator, which is why there's no   */
+/*  polling loop here: an open EventSource *is* the liveness check.           */
+/* -------------------------------------------------------------------------- */
+
+/** @type {EventSource|null} */
+let liveSource = null;
+/** Path `liveSource` is subscribed to (null when there's no stream). */
+let livePath = null;
+/** True while a live re-list is in flight, so overlapping signals collapse
+ *  into one follow-up fetch instead of stacking. */
+let refreshInFlight = false;
+let refreshQueued = false;
+/** Set when a signal arrives at a moment where re-rendering would disrupt
+ *  the user (mid inline-rename); applied as soon as that clears. */
+let refreshDeferred = false;
+let probeScheduled = false;
+/** Backoff for reconnects we have to drive ourselves (see below). */
+let liveRetryMs = 2000;
+const LIVE_RETRY_MAX_MS = 30000;
+
+/** Point the live stream at `path`, closing any previous one. */
+function watchPath(path) {
+  if (liveSource && livePath === path) return;
+  closeLive();
+  livePath = path;
+  let src;
+  try {
+    src = new EventSource(`/api/events?path=${encodeURIComponent(path)}`);
+  } catch {
+    // No EventSource (or it refused to construct) — the app still works,
+    // it just won't update on its own.
+    return;
+  }
+  liveSource = src;
+  src.addEventListener("open", () => {
+    if (liveSource !== src) return;
+    liveRetryMs = 2000;
+    setConnected(true);
+  });
+  src.addEventListener("dirty", () => {
+    if (liveSource === src) scheduleRefresh();
+  });
+  src.addEventListener("error", () => {
+    if (liveSource !== src) return;
+    setConnected(false);
+    // A dropped *connection* is retried by the browser on its own. An HTTP
+    // error status is not: per spec any non-200 (401 once the session
+    // expires, 404 once the folder is gone, 429 under rate limiting) closes
+    // an EventSource for good. So we probe out of band to find out which
+    // case we're in, and rebuild the stream ourselves when it's dead.
+    probeLiveFailure();
+  });
+}
+
+function closeLive() {
+  if (liveSource) {
+    liveSource.close();
+    liveSource = null;
+  }
+  livePath = null;
+}
+
+function probeLiveFailure() {
+  if (probeScheduled) return;
+  probeScheduled = true;
+  const delay = liveRetryMs;
+  liveRetryMs = Math.min(liveRetryMs * 2, LIVE_RETRY_MAX_MS);
+  setTimeout(async () => {
+    probeScheduled = false;
+    const src = liveSource;
+    // Recovered by itself (or we navigated) while we were waiting.
+    if (!src || src.readyState === EventSource.OPEN) return;
+    try {
+      const res = await fetch("/api/me", {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (res.status === 401) {
+        redirectToLogin();
+        return;
+      }
+      if (!res.ok) return;
+      // The server is reachable and we're still signed in, so it's this
+      // stream that's unhappy. Re-list first: that either picks up whatever
+      // we missed, or discovers the folder is gone and moves us to its
+      // parent (which opens a stream of its own).
+      scheduleRefresh();
+      if (liveSource === src && src.readyState === EventSource.CLOSED) {
+        const path = livePath;
+        closeLive();
+        watchPath(path);
+      }
+    } catch {
+      /* still offline — retry on the next error, with a longer delay */
+    }
+  }, delay);
+}
+
+// Coming back to a backgrounded tab (or waking the machine) is the common
+// way to end up holding a stream that died a while ago. Check on the way in
+// instead of waiting out the reconnect backoff.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (!liveSource || liveSource.readyState === EventSource.CLOSED) {
+    const path = livePath !== null ? livePath : state.path;
+    closeLive();
+    watchPath(path);
+  }
+  scheduleRefresh();
+});
+
+function scheduleRefresh() {
+  // Recreating rows mid-rename would rebuild the <input> and reset the
+  // caret, so hold the update until the edit finishes.
+  if (state.editing) {
+    refreshDeferred = true;
+    return;
+  }
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return;
+  }
+  refreshPath();
+}
+
+/** Called when an inline rename ends, to apply anything we held back. */
+function flushDeferredRefresh() {
+  if (!refreshDeferred || state.editing) return;
+  refreshDeferred = false;
+  scheduleRefresh();
+}
+
+/**
+ * Re-list the current folder and merge the result into place. Unlike
+ * loadPath() this preserves the filter box, scroll position, selection, and
+ * pending clipboard — it can fire at any moment, so it must not disturb
+ * whatever the user is in the middle of.
+ */
+async function refreshPath() {
+  refreshInFlight = true;
+  const requested = state.path;
+  try {
+    const res = await api(`/api/list?path=${encodeURIComponent(requested)}`);
+    const data = await res.json();
+    // Navigated elsewhere while the fetch was in flight — this listing is
+    // for a folder we're no longer showing.
+    if (data.path !== state.path) return;
+    applyEntries(data.entries);
+    setConnected(true);
+  } catch (err) {
+    if (err.status === 404) {
+      // The folder we're viewing was deleted out from under us. Fall back to
+      // its parent rather than sitting on a listing that no longer exists.
+      if (requested !== state.path) return;
+      const parts = state.path.split("/");
+      parts.pop();
+      loadPath(parts.join("/"));
+      return;
+    }
+    if (err.message !== "unauthorized") setConnected(false);
+  } finally {
+    refreshInFlight = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      scheduleRefresh();
+    }
+  }
+}
+
+/** Swap in a fresh set of entries without losing the user's context. */
+function applyEntries(entries) {
+  state.entries = entries;
+  const live = new Set(entries.map((e) => e.name));
+  // Anything the user had earmarked that no longer exists has to go, or the
+  // selection summary and paste would reference ghosts. Everything else —
+  // including a clipboard staged from another folder — survives untouched.
+  for (const name of [...state.selected]) {
+    if (!live.has(name)) state.selected.delete(name);
+  }
+  if (state.clipboard && state.clipboard.sourcePath === state.path) {
+    state.clipboard.names = state.clipboard.names.filter((n) => live.has(n));
+    if (state.clipboard.names.length === 0) state.clipboard = null;
+  }
+  const scrollTop = els.viewport.scrollTop;
+  renderList();
+  // renderList() positions rows against the scroll offset it read *before*
+  // the spacer resized; if the shorter list clamped our scroll, restore it
+  // and re-render against the corrected offset.
+  if (els.viewport.scrollTop !== scrollTop) {
+    els.viewport.scrollTop = scrollTop;
+    renderVisible();
+  }
+  renderSelection();
+  renderClipboard();
 }
 
 function renderCrumbs() {
@@ -380,13 +617,17 @@ function renderCrumbs() {
     a.addEventListener("click", () => loadPath(target));
     return a;
   };
-  frag.appendChild(mk("root", "", parts.length === 0));
+  frag.appendChild(mk("/", "", parts.length === 0));
   let acc = "";
   parts.forEach((part, i) => {
-    const sep = document.createElement("span");
-    sep.className = "crumb-sep";
-    sep.textContent = "/";
-    frag.appendChild(sep);
+    // The root crumb is already "/", so the separator before the first part
+    // would render as a doubled slash.
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "crumb-sep";
+      sep.textContent = "/";
+      frag.appendChild(sep);
+    }
     acc = acc ? `${acc}/${part}` : part;
     frag.appendChild(mk(part, acc, i === parts.length - 1));
   });
@@ -887,6 +1128,7 @@ function cancelRename() {
   if (!state.editing) return;
   state.editing = null;
   renderVisible();
+  flushDeferredRefresh();
 }
 
 async function commitRename(entry) {
@@ -928,6 +1170,7 @@ async function commitRename(entry) {
     }
     renderList();
     renderSelection();
+    flushDeferredRefresh();
   } catch (err) {
     uiAlert(`Rename failed: ${err.message}`);
     // Revert: re-open the editor on the original row with what the user typed
@@ -1370,11 +1613,28 @@ window.addEventListener("drop", (ev) => {
 els.viewport.addEventListener("scroll", renderVisible, { passive: true });
 window.addEventListener("resize", renderVisible);
 
+function updateFilterClear() {
+  const hasValue = els.filter.value.length > 0;
+  els.filterClear.hidden = !hasValue;
+  els.filter.classList.toggle("has-value", hasValue);
+}
+
 els.filter.addEventListener("input", () => {
   state.filter = els.filter.value.trim();
   state.selected.clear();
+  updateFilterClear();
   renderList();
   renderSelection();
+});
+
+els.filterClear.addEventListener("click", () => {
+  els.filter.value = "";
+  state.filter = "";
+  state.selected.clear();
+  updateFilterClear();
+  renderList();
+  renderSelection();
+  els.filter.focus();
 });
 
 els.selectAll.addEventListener("change", () => {
@@ -1394,8 +1654,6 @@ els.btnUp.addEventListener("click", () => {
   parts.pop();
   loadPath(parts.join("/"));
 });
-
-els.btnRefresh.addEventListener("click", () => loadPath(state.path));
 
 els.btnDownload.addEventListener("click", downloadSelection);
 els.btnCut.addEventListener("click", () => setClipboard("move"));
@@ -2448,6 +2706,7 @@ els.previewModal.addEventListener("keydown", (ev) => {
 /* -------------------------------------------------------------------------- */
 
 loadMe();
-ping();
-setInterval(ping, 5000);
+// loadPath() opens the live stream for whatever folder it lands on; the
+// stream then keeps the listing and the connection indicator up to date, so
+// there's no polling loop to start here.
 loadPath(pathFromHash());
