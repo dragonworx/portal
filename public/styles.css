@@ -362,6 +362,12 @@ input[type="checkbox"] { accent-color: var(--accent); }
   grid-template-rows: auto 1fr;
   min-height: 0;
   position: relative;
+  /* Pin to the body grid's last (1fr) row explicitly: .clipboard-chip
+     (the sibling before this one) is `display: none` when hidden, which
+     removes it from grid auto-placement entirely and would otherwise shift
+     this element into the wrong (auto-sized) row, collapsing it to just
+     its header's height. */
+  grid-row: 4;
 }
 .list-header, .row {
   display: grid;
@@ -657,7 +663,7 @@ body.select-anim .cell-check input[type="checkbox"] {
 
 .empty {
   position: absolute;
-  inset: 36px 0 0 0;
+  inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
