@@ -55,6 +55,7 @@ const els = {
   previewSynced: document.getElementById("preview-synced"),
   previewBody: document.getElementById("preview-body"),
   previewDownload: document.getElementById("preview-download"),
+  previewCopy: document.getElementById("preview-copy"),
   previewClose: document.getElementById("preview-close"),
 };
 
@@ -2149,20 +2150,31 @@ async function copyToClipboard(text) {
   }
 }
 
-async function copyEditor() {
-  if (!editorState.cm) return;
-  const text = editorState.cm.getValue();
-  const prevLabel = els.editorCopy.textContent;
+/** Copies a CodeMirror instance's full contents to the clipboard, flashing
+ *  `btn`'s label to confirm. Shared by the editor's and preview's Copy
+ *  buttons. */
+async function copyCmContents(cm, btn) {
+  if (!cm) return;
+  const text = cm.getValue();
+  const prevLabel = btn.textContent;
   try {
     await copyToClipboard(text);
-    els.editorCopy.textContent = "Copied!";
+    btn.textContent = "Copied!";
   } catch (err) {
     uiAlert(`Copy failed: ${err.message}`);
   } finally {
     setTimeout(() => {
-      els.editorCopy.textContent = prevLabel;
+      btn.textContent = prevLabel;
     }, 1200);
   }
+}
+
+function copyEditor() {
+  return copyCmContents(editorState.cm, els.editorCopy);
+}
+
+function copyPreview() {
+  return copyCmContents(previewState.cm, els.previewCopy);
 }
 
 /** Timer backing the transient "updated elsewhere" badge. */
@@ -2386,6 +2398,7 @@ async function openPreview(entry) {
   els.previewTitle.title = "/" + fullPath;
   els.previewMeta.textContent = "loading…";
   hidePreviewSynced();
+  els.previewCopy.hidden = true;
   els.previewBody.replaceChildren(previewNote("⏳", "Loading preview…"));
   els.previewModal.hidden = false;
   document.body.classList.add("preview-open");
@@ -2799,6 +2812,7 @@ async function showTextPreview(fullPath, entry) {
     },
   });
   previewState.cm = cm;
+  els.previewCopy.hidden = false;
   cm.setSize("100%", "100%");
   // Refresh once laid out so CodeMirror measures the viewport correctly.
   requestAnimationFrame(() => cm.refresh());
@@ -2838,6 +2852,7 @@ function closePreview() {
   previewState.cm = null;
   previewState.objectUrl = null;
   hidePreviewSynced();
+  els.previewCopy.hidden = true;
 }
 
 /** Timer backing the preview modal's transient "updated elsewhere" badge. */
@@ -2927,6 +2942,7 @@ async function syncPreviewWithDiskOnce() {
 }
 
 els.previewClose.addEventListener("click", closePreview);
+els.previewCopy.addEventListener("click", () => copyPreview());
 els.previewDownload.addEventListener("click", () => {
   if (!previewState.path) return;
   const name = previewState.path.split("/").pop() || "download";
