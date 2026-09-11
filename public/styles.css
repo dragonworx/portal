@@ -934,6 +934,7 @@ body.editor-open { overflow: hidden; }
 }
 .editor-meta { display: inline-flex; align-items: center; }
 .editor-dirty { color: var(--warn); }
+.editor-synced { color: var(--good); }
 
 .editor-actions {
   display: inline-flex;

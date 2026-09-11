@@ -164,11 +164,13 @@
               <span class="editor-subtitle">
                 <span class="editor-meta" id="editor-mode">plain text</span>
                 <span class="editor-meta editor-dirty" id="editor-dirty" hidden>● unsaved</span>
+                <span class="editor-meta editor-synced" id="editor-synced" hidden>↻ updated elsewhere</span>
               </span>
             </div>
           </div>
           <div class="editor-actions">
-            <button id="editor-cancel" class="btn ghost" type="button">Cancel</button>
+            <button id="editor-cancel" class="btn ghost" type="button">Close</button>
+            <button id="editor-copy" class="btn ghost" type="button">Copy</button>
             <button id="editor-save" class="btn primary" type="button">Save</button>
           </div>
         </header>
@@ -201,6 +203,7 @@
               <strong id="preview-title" class="editor-path">file</strong>
               <span class="editor-subtitle">
                 <span class="editor-meta" id="preview-meta">preview</span>
+                <span class="editor-meta editor-synced" id="preview-synced" hidden>↻ updated elsewhere</span>
               </span>
             </div>
           </div>

@@ -40,16 +40,19 @@ const els = {
   editorTitle: document.getElementById("editor-title"),
   editorMode: document.getElementById("editor-mode"),
   editorDirty: document.getElementById("editor-dirty"),
+  editorSynced: document.getElementById("editor-synced"),
   editorWarning: document.getElementById("editor-warning"),
   editorWarningMsg: document.getElementById("editor-warning-msg"),
   editorBody: document.getElementById("editor-body"),
   editorSave: document.getElementById("editor-save"),
+  editorCopy: document.getElementById("editor-copy"),
   editorCancel: document.getElementById("editor-cancel"),
   // File preview (fullscreen modal).
   previewModal: document.getElementById("preview-modal"),
   previewIcon: document.getElementById("preview-icon"),
   previewTitle: document.getElementById("preview-title"),
   previewMeta: document.getElementById("preview-meta"),
+  previewSynced: document.getElementById("preview-synced"),
   previewBody: document.getElementById("preview-body"),
   previewDownload: document.getElementById("preview-download"),
   previewClose: document.getElementById("preview-close"),
@@ -451,7 +454,10 @@ function watchPath(path) {
     setConnected(true);
   });
   src.addEventListener("dirty", () => {
-    if (liveSource === src) scheduleRefresh();
+    if (liveSource !== src) return;
+    scheduleRefresh();
+    syncEditorWithDisk();
+    syncPreviewWithDisk();
   });
   src.addEventListener("error", () => {
     if (liveSource !== src) return;
@@ -498,6 +504,8 @@ function probeLiveFailure() {
       // we missed, or discovers the folder is gone and moves us to its
       // parent (which opens a stream of its own).
       scheduleRefresh();
+      syncEditorWithDisk();
+      syncPreviewWithDisk();
       if (liveSource === src && src.readyState === EventSource.CLOSED) {
         const path = livePath;
         closeLive();
@@ -520,6 +528,8 @@ document.addEventListener("visibilitychange", () => {
     watchPath(path);
   }
   scheduleRefresh();
+  syncEditorWithDisk();
+  syncPreviewWithDisk();
 });
 
 function scheduleRefresh() {
@@ -1987,6 +1997,7 @@ async function openEditor(entry) {
   els.editorTitle.title = "/" + fullPath;
   els.editorMode.textContent = modeInfo.label || "plain text";
   els.editorDirty.hidden = true;
+  hideEditorSynced();
   if (looksBinary) {
     const reasons = [];
     if (extBinary) reasons.push(`".${ext}" files are normally binary`);
@@ -2050,8 +2061,8 @@ async function saveEditor() {
   if (!editorState.path || !editorState.cm) return;
   const text = editorState.cm.getValue();
   if (text === editorState.originalText) {
-    // No-op save: just close.
-    closeEditor(true);
+    // No-op save (e.g. Cmd-S with nothing changed): nothing to do, and
+    // saving never closes the editor, so there's nothing else to do here.
     return;
   }
   if (editorState.looksBinary) {
@@ -2096,12 +2107,13 @@ async function saveEditor() {
     }
     editorState.originalText = text;
     els.editorDirty.hidden = true;
+    hideEditorSynced();
     // If the file lives in the folder we're currently viewing, refresh the
-    // listing so size / mtime update.
+    // listing so size / mtime update. The editor itself stays open — saving
+    // is not a reason to close it.
     const parent = editorState.path.includes("/")
       ? editorState.path.slice(0, editorState.path.lastIndexOf("/"))
       : "";
-    closeEditor(true);
     if (parent === state.path) loadPath(state.path);
   } catch (err) {
     uiAlert(`Save failed: ${err.message}`);
@@ -2113,6 +2125,152 @@ async function saveEditor() {
         editorState.cm.getValue() === editorState.originalText;
     }
   }
+}
+
+/** Copies `text` to the clipboard, falling back to a hidden-textarea +
+ *  execCommand for browsers/contexts without the async Clipboard API
+ *  (e.g. non-HTTPS origins). */
+async function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("copy command failed");
+  } finally {
+    document.body.removeChild(ta);
+  }
+}
+
+async function copyEditor() {
+  if (!editorState.cm) return;
+  const text = editorState.cm.getValue();
+  const prevLabel = els.editorCopy.textContent;
+  try {
+    await copyToClipboard(text);
+    els.editorCopy.textContent = "Copied!";
+  } catch (err) {
+    uiAlert(`Copy failed: ${err.message}`);
+  } finally {
+    setTimeout(() => {
+      els.editorCopy.textContent = prevLabel;
+    }, 1200);
+  }
+}
+
+/** Timer backing the transient "updated elsewhere" badge. */
+let editorSyncedTimer = null;
+
+function hideEditorSynced() {
+  if (editorSyncedTimer) {
+    clearTimeout(editorSyncedTimer);
+    editorSyncedTimer = null;
+  }
+  els.editorSynced.hidden = true;
+}
+
+function flashEditorSynced() {
+  els.editorSynced.hidden = false;
+  if (editorSyncedTimer) clearTimeout(editorSyncedTimer);
+  editorSyncedTimer = setTimeout(() => {
+    editorSyncedTimer = null;
+    els.editorSynced.hidden = true;
+  }, 4000);
+}
+
+/** True while a remote-change refetch is in flight, so overlapping "dirty"
+ *  signals collapse into one follow-up fetch instead of stacking. */
+let editorSyncInFlight = false;
+let editorSyncQueued = false;
+
+/** Called whenever the folder we're watching reports a change while the
+ *  editor is open. Re-reads the file being edited straight from disk and,
+ *  if it actually changed underneath us — another machine or tab saved it
+ *  — replaces the editor's content wholesale. The filesystem is the single
+ *  source of truth here, same as it is for the directory listing: the
+ *  latest save anywhere wins, even over whatever's mid-edit locally. */
+async function syncEditorWithDisk() {
+  if (!editorState.path) return;
+  const parent = editorState.path.includes("/")
+    ? editorState.path.slice(0, editorState.path.lastIndexOf("/"))
+    : "";
+  if (parent !== livePath) return;
+  if (editorSyncInFlight) {
+    editorSyncQueued = true;
+    return;
+  }
+  editorSyncInFlight = true;
+  try {
+    do {
+      editorSyncQueued = false;
+      await syncEditorWithDiskOnce();
+    } while (editorSyncQueued && editorState.path);
+  } finally {
+    editorSyncInFlight = false;
+  }
+}
+
+async function syncEditorWithDiskOnce() {
+  const path = editorState.path;
+  if (!path || !editorState.cm) return;
+  let res;
+  try {
+    res = await api(`/api/file?path=${encodeURIComponent(path)}`);
+  } catch (err) {
+    if (err.status === 404 && editorState.path === path) {
+      uiAlert("This file was deleted elsewhere.");
+      closeEditor(true);
+    }
+    return; // transient errors: the next dirty signal (or reconnect) retries
+  }
+  // The editor may have been closed, or the save above may have already
+  // moved originalText, while this fetch was in flight.
+  if (editorState.path !== path || !editorState.cm) return;
+
+  let bytes;
+  try {
+    bytes = new Uint8Array(await res.arrayBuffer());
+  } catch {
+    return;
+  }
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  if (text === editorState.originalText) return; // this file didn't actually change
+
+  const cm = editorState.cm;
+  const cursor = cm.getCursor();
+  const scroll = cm.getScrollInfo();
+  cm.setValue(text);
+  // Re-normalise the same way the initial load does (CodeMirror collapses
+  // CRLF -> LF on input), so the dirty check stays accurate afterwards.
+  editorState.originalText = cm.getValue();
+  const name = path.includes("/") ? path.slice(path.lastIndexOf("/") + 1) : path;
+  editorState.looksBinary = BINARY_EXTS.has(extOf(name)) || bytesLookBinary(bytes);
+  if (editorState.looksBinary) {
+    els.editorWarningMsg.textContent =
+      "Warning: this file now looks binary. Saving will overwrite it with " +
+      "whatever you see below — that will corrupt the original.";
+    els.editorWarning.hidden = false;
+  } else {
+    els.editorWarning.hidden = true;
+    els.editorWarningMsg.textContent = "";
+  }
+  els.editorDirty.hidden = true;
+  els.editorSave.disabled = true;
+  try {
+    cm.setCursor(cursor);
+    cm.scrollTo(scroll.left, scroll.top);
+  } catch {
+    /* best-effort cursor/scroll restore — a shorter file can make the old
+     * cursor position invalid, CodeMirror clamps it either way */
+  }
+  flashEditorSynced();
 }
 
 async function closeEditor(force) {
@@ -2139,9 +2297,11 @@ async function closeEditor(force) {
   editorState.looksBinary = false;
   els.editorDirty.hidden = true;
   els.editorWarning.hidden = true;
+  hideEditorSynced();
 }
 
 els.editorSave.addEventListener("click", () => saveEditor());
+els.editorCopy.addEventListener("click", () => copyEditor());
 els.editorCancel.addEventListener("click", () => closeEditor(false));
 // Clicking the dim backdrop closes (with the usual unsaved-changes prompt).
 els.editorModal.addEventListener("click", (ev) => {
@@ -2225,6 +2385,7 @@ async function openPreview(entry) {
   els.previewTitle.textContent = "/" + fullPath;
   els.previewTitle.title = "/" + fullPath;
   els.previewMeta.textContent = "loading…";
+  hidePreviewSynced();
   els.previewBody.replaceChildren(previewNote("⏳", "Loading preview…"));
   els.previewModal.hidden = false;
   document.body.classList.add("preview-open");
@@ -2676,6 +2837,93 @@ function closePreview() {
   previewState.path = null;
   previewState.cm = null;
   previewState.objectUrl = null;
+  hidePreviewSynced();
+}
+
+/** Timer backing the preview modal's transient "updated elsewhere" badge. */
+let previewSyncedTimer = null;
+
+function hidePreviewSynced() {
+  if (previewSyncedTimer) {
+    clearTimeout(previewSyncedTimer);
+    previewSyncedTimer = null;
+  }
+  els.previewSynced.hidden = true;
+}
+
+function flashPreviewSynced() {
+  els.previewSynced.hidden = false;
+  if (previewSyncedTimer) clearTimeout(previewSyncedTimer);
+  previewSyncedTimer = setTimeout(() => {
+    previewSyncedTimer = null;
+    els.previewSynced.hidden = true;
+  }, 4000);
+}
+
+/** True while a remote-change refetch is in flight for the read-only
+ *  preview, so overlapping "dirty" signals collapse into one follow-up
+ *  fetch instead of stacking. */
+let previewSyncInFlight = false;
+let previewSyncQueued = false;
+
+/** Mirrors syncEditorWithDisk() for the read-only preview modal: when the
+ *  text file currently shown in the preview changes on disk (another
+ *  machine/tab saved it), reload it in place. Only the CodeMirror text
+ *  preview needs this — image/video/audio previews stream or already
+ *  re-fetch their bytes each time they're opened. */
+async function syncPreviewWithDisk() {
+  if (!previewState.path || !previewState.cm) return;
+  const parent = previewState.path.includes("/")
+    ? previewState.path.slice(0, previewState.path.lastIndexOf("/"))
+    : "";
+  if (parent !== livePath) return;
+  if (previewSyncInFlight) {
+    previewSyncQueued = true;
+    return;
+  }
+  previewSyncInFlight = true;
+  try {
+    do {
+      previewSyncQueued = false;
+      await syncPreviewWithDiskOnce();
+    } while (previewSyncQueued && previewState.path);
+  } finally {
+    previewSyncInFlight = false;
+  }
+}
+
+async function syncPreviewWithDiskOnce() {
+  const path = previewState.path;
+  if (!path || !previewState.cm) return;
+  let res;
+  try {
+    res = await api(`/api/file?path=${encodeURIComponent(path)}`);
+  } catch (err) {
+    if (err.status === 404 && previewState.path === path) {
+      closePreview();
+    }
+    return; // transient errors: the next dirty signal (or reconnect) retries
+  }
+  if (previewState.path !== path || !previewState.cm) return;
+
+  let bytes;
+  try {
+    bytes = new Uint8Array(await res.arrayBuffer());
+  } catch {
+    return;
+  }
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  const cm = previewState.cm;
+  if (text === cm.getValue()) return; // this file didn't actually change
+
+  const scroll = cm.getScrollInfo();
+  cm.setValue(text);
+  cm.scrollTo(scroll.left, scroll.top);
+  const lines = text === "" ? 0 : text.split("\n").length;
+  const label = (els.previewMeta.textContent || "plain text").split(" • ")[0];
+  els.previewMeta.textContent =
+    `${label} • ${lines} line${lines === 1 ? "" : "s"} • ${fmtSize(bytes.byteLength)}`;
+  flashPreviewSynced();
 }
 
 els.previewClose.addEventListener("click", closePreview);
