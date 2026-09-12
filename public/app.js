@@ -955,13 +955,23 @@ function openRowMenu(anchor, entry, row) {
     items.push(item);
   };
 
+  if (entry.type === "file") {
+    addItem("action-download", "Download", () => {
+      triggerDownload(
+        `/api/download?path=${encodeURIComponent(joinPath(entry.name))}`,
+        entry.name,
+      );
+    });
+  }
+  addItem("action-rename", "Rename", () => beginRename(entry));
   // Edit-content (text files): opens the fullscreen editor. Shown on every
   // file regardless of extension — the editor itself warns when the file
   // looks binary. Hidden for directories to keep the menu clean.
   if (entry.type === "file") {
     addItem("action-edit", "Edit", () => openEditor(entry));
   }
-  addItem("action-rename", "Rename", () => beginRename(entry));
+  addItem("action-copy", "Copy", () => setClipboardNames("copy", [entry.name]));
+  addItem("action-cut", "Cut", () => setClipboardNames("move", [entry.name]));
   addItem("action-delete danger", "Delete", () => deleteEntry(entry));
 
   // Menu keyboard navigation (roving focus between items).
@@ -1256,20 +1266,28 @@ async function deleteEntry(entry) {
 
 function setClipboard(mode) {
   if (state.selected.size === 0) return;
-  // Snapshot the selection so subsequent navigation / re-selection doesn't
-  // mutate the pending operation.
-  state.clipboard = {
-    mode,
-    sourcePath: state.path,
-    names: Array.from(state.selected),
-  };
+  setClipboardNames(mode, Array.from(state.selected));
   // Always clear the selection on enter: the listing now repurposes it as a
   // single-folder destination picker. Source rows from a "cut" stay visible
   // via the .clipped class, which doesn't depend on state.selected.
   state.selected.clear();
+  renderSelection();
+}
+
+/** Put `names` (resolved against the current folder) into the app's
+ *  cut/copy clipboard. Shared by the toolbar's selection-based setClipboard()
+ *  and the row menu's single-entry copy/cut actions. */
+function setClipboardNames(mode, names) {
+  if (names.length === 0) return;
+  // Snapshot the names so subsequent navigation / re-selection doesn't
+  // mutate the pending operation.
+  state.clipboard = {
+    mode,
+    sourcePath: state.path,
+    names,
+  };
   renderClipboard();
   renderVisible();
-  renderSelection();
 }
 
 function clearClipboard() {

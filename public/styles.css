@@ -645,6 +645,9 @@ body.select-anim .cell-check input[type="checkbox"] {
 }
 .row-menu-item.danger .icon { color: var(--bad); }
 .row-menu-item.action-edit .icon { --icon: url("/edit.svg"); }
+.row-menu-item.action-download .icon { --icon: url("/download.svg"); }
+.row-menu-item.action-copy .icon { --icon: url("/copy.svg"); }
+.row-menu-item.action-cut .icon { --icon: url("/cut.svg"); }
 .row-menu-item.action-rename .icon { --icon: url("/rename.svg"); }
 .row-menu-item.action-delete .icon { --icon: url("/delete.svg"); }
 
