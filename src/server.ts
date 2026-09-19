@@ -1,8 +1,6 @@
-import { stat, readdir, mkdir, rm, rename, cp, writeFile } from "node:fs/promises";
+import { stat, readdir, mkdir, rm, rename, cp, writeFile, open, unlink } from "node:fs/promises";
 import {
-  createWriteStream,
   constants as fsConstants,
-  openSync,
   watch,
   type FSWatcher,
 } from "node:fs";
@@ -733,6 +731,38 @@ async function handleZip(req: Request): Promise<Response> {
   });
 }
 
+/** How long a single upload body read may stall before we give up on it.
+ *  Generous enough that a slow-but-moving connection is never cut off (the
+ *  timer resets on every chunk, so total duration is unbounded), short
+ *  enough that a dead connection surfaces as an error instead of a
+ *  request that sits open for the better part of an hour. */
+const UPLOAD_STALL_TIMEOUT_MS = 30_000;
+
+/**
+ * `reader.read()`, but rejecting with a 408 if no chunk arrives within
+ * `timeoutMs`. The abandoned read settles into nothing if it ever does
+ * resolve — the caller cancels the reader on the way out.
+ */
+async function readOrStall(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, rej) => {
+        timer = setTimeout(
+          () => rej(new PathError("Upload stalled — no data received", 408)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function handleUpload(req: Request, url: URL): Promise<Response> {
   const dirParam = url.searchParams.get("path") ?? "";
   const name = url.searchParams.get("name") ?? "";
@@ -770,13 +800,20 @@ async function handleUpload(req: Request, url: URL): Promise<Response> {
   // Stream the request body to disk so we never buffer the whole file.
   // O_NOFOLLOW: if the destination already exists as a symlink (placed in
   // /data out-of-band) the open(2) call will fail with ELOOP rather than
-  // silently writing through the link to its target. We open the fd
-  // ourselves (rather than letting createWriteStream do it) so we can pass
-  // a numeric flags mask — the StreamOptions.flags type only accepts
-  // strings, which can't express O_NOFOLLOW.
-  let fd: number;
+  // silently writing through the link to its target. fs/promises.open()
+  // (not openSync): this runs on every upload, and a blocking syscall here
+  // stalls Bun's single-threaded event loop for every other request in
+  // flight — not just this one — for as long as the open() takes. We get
+  // the write stream from the handle itself (handle.createWriteStream())
+  // rather than pulling out the numeric fd and handing it to the top-level
+  // createWriteStream: a FileHandle whose fd got closed out from under it
+  // by someone else is a fatal error here ("FileHandle object was closed
+  // during garbage collection") the moment the GC finalizer runs, which
+  // takes the whole process down. Handing the handle its own stream keeps
+  // the two in sync — the stream closes the handle it owns, not a bare fd.
+  let handle;
   try {
-    fd = openSync(
+    handle = await open(
       dest,
       fsConstants.O_WRONLY |
         fsConstants.O_CREAT |
@@ -797,7 +834,7 @@ async function handleUpload(req: Request, url: URL): Promise<Response> {
     }
     throw err;
   }
-  const sink = createWriteStream("", { fd, autoClose: true });
+  const sink = handle.createWriteStream();
   // Surface stream-open errors (ELOOP from O_NOFOLLOW, EACCES, etc.) as a
   // proper PathError instead of letting them bubble up as unhandled
   // 'error' events on the WriteStream.
@@ -811,7 +848,14 @@ async function handleUpload(req: Request, url: URL): Promise<Response> {
       sinkErrored,
       (async () => {
         while (true) {
-          const { value, done } = await reader.read();
+          // Bun's own idleTimeout doesn't reliably cut off a client that
+          // goes silent mid-body (observed in production: uploads sitting
+          // open for tens of minutes with no data and no error, the
+          // request never resolving either way). Bound each read
+          // ourselves so a stalled connection fails fast and visibly
+          // instead of hanging indefinitely with the UI stuck at
+          // "100%" and no feedback.
+          const { value, done } = await readOrStall(reader, UPLOAD_STALL_TIMEOUT_MS);
           if (done) break;
           received += value.byteLength;
           if (received > config.maxUploadBytes) {
@@ -829,6 +873,21 @@ async function handleUpload(req: Request, url: URL): Promise<Response> {
     ]);
   } catch (err) {
     sink.destroy();
+    // Release the body reader so a stalled/abandoned client stream doesn't
+    // keep sitting there after we've given up on it.
+    await reader.cancel().catch(() => {});
+    // The open() above truncated whatever was at `dest` before it — on any
+    // failure partway through the body we'd otherwise leave a truncated,
+    // silently-corrupt file behind (indistinguishable from a real one in
+    // the listing) rather than no file at all. Best-effort: a failure here
+    // just means the stale partial write sits there, which is the status
+    // quo we're trying to avoid, not a new problem.
+    await unlink(dest).catch(() => {});
+    console.error(
+      `[portal] upload aborted after ${received}/${contentLength || "?"} bytes ` +
+        `for ${dest}:`,
+      err,
+    );
     if (err instanceof PathError) throw err;
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ELOOP") {

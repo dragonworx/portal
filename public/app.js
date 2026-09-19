@@ -1529,6 +1529,24 @@ function triggerDownload(url, filename) {
 /*  Uploads                                                                   */
 /* -------------------------------------------------------------------------- */
 
+/** Give up on an upload that shows no sign of life for this long. Set above
+ *  the server's own stall timeout so its 408 ("Upload stalled") wins the
+ *  race and we show that instead — this is the backstop for when no
+ *  response arrives at all. */
+const UPLOAD_STALL_TIMEOUT_MS = 45000;
+
+/** Uploads currently in flight. A navigation mid-upload kills the request
+ *  with no error event — the JS that would report it goes away with the
+ *  document — so the upload silently truncates server-side. Warning on the
+ *  way out turns that into something the user can see and cancel. */
+let uploadsInFlight = 0;
+window.addEventListener("beforeunload", (ev) => {
+  if (uploadsInFlight === 0) return;
+  ev.preventDefault();
+  // Legacy spelling, still required by some browsers to trigger the prompt.
+  ev.returnValue = "";
+});
+
 function uploadFiles(fileList) {
   if (!fileList || fileList.length === 0) return;
   els.uploads.hidden = false;
@@ -1563,11 +1581,48 @@ function uploadOne(file) {
   const csrf = getCsrfToken();
   if (csrf) xhr.setRequestHeader("x-csrf-token", csrf);
 
+  // Stall watchdog. Reaching 100% only means the bytes left this machine —
+  // the server still has to answer, and that answer can go missing (a dead
+  // connection the browser hasn't noticed, a proxy that dropped us). Without
+  // this the row sits at "100%" indefinitely and the upload looks hung with
+  // nothing to act on. A flat xhr.timeout can't do the job: it caps total
+  // duration, which would kill legitimately slow large uploads. So: arm a
+  // timer, push it forward on every sign of life, and fail loudly if
+  // nothing happens for that long.
+  let stallTimer = null;
+  const clearStall = () => {
+    if (stallTimer !== null) {
+      clearTimeout(stallTimer);
+      stallTimer = null;
+    }
+  };
+  const armStall = () => {
+    clearStall();
+    stallTimer = setTimeout(() => {
+      stallTimer = null;
+      // abort() fires our "abort" handler below, which paints the row.
+      xhr.abort();
+    }, UPLOAD_STALL_TIMEOUT_MS);
+  };
+
   xhr.upload.addEventListener("progress", (ev) => {
+    armStall();
     if (!ev.lengthComputable) return;
     const pct = (ev.loaded / ev.total) * 100;
     barFill.style.width = pct.toFixed(1) + "%";
     state_.textContent = `${pct.toFixed(0)}% • ${fmtSize(ev.loaded)} / ${fmtSize(ev.total)}`;
+  });
+
+  xhr.addEventListener("abort", () => {
+    clearStall();
+    li.classList.add("err");
+    state_.classList.add("err");
+    state_.textContent = "stalled — no response from server, try again";
+  });
+
+  xhr.addEventListener("loadend", () => {
+    clearStall();
+    uploadsInFlight = Math.max(0, uploadsInFlight - 1);
   });
 
   xhr.addEventListener("load", () => {
@@ -1603,6 +1658,8 @@ function uploadOne(file) {
     state_.textContent = "network error";
   });
 
+  uploadsInFlight++;
+  armStall();
   xhr.send(file);
 }
 
@@ -1610,28 +1667,44 @@ function uploadOne(file) {
 /*  Drag-and-drop uploads                                                     */
 /* -------------------------------------------------------------------------- */
 
+/** Does this drag carry files (as opposed to selected text, a link, …)? */
+function dragHasFiles(ev) {
+  return !!ev.dataTransfer && Array.from(ev.dataTransfer.types).includes("Files");
+}
+
 let dragDepth = 0;
 window.addEventListener("dragenter", (ev) => {
-  if (!ev.dataTransfer || !Array.from(ev.dataTransfer.types).includes("Files")) return;
+  if (!dragHasFiles(ev)) return;
   dragDepth++;
   els.dropzonePath.textContent = "/" + state.path;
   els.dropzone.hidden = false;
 });
+// preventDefault() on dragover+drop is what stops the browser doing its
+// default thing with a dropped file, which is to NAVIGATE THE PAGE to it.
+// That navigation tears down the document mid-upload: the XHR dies with no
+// error event (the JS that would report it is already gone), the server sees
+// a truncated body, and it reads as "the upload hung and the app reloaded
+// itself". So both handlers must preventDefault for *every* file drag —
+// never gated on dropzone visibility. `dragDepth` tracks enter/leave pairs
+// to decide when to *show* the overlay, and that counter is inherently
+// lossy (these fire per element boundary crossed, and a drag that leaves
+// the window can skip the final dragleave), so it must never be load-
+// bearing for preventDefault.
 window.addEventListener("dragover", (ev) => {
-  if (!els.dropzone.hidden) ev.preventDefault();
+  if (dragHasFiles(ev)) ev.preventDefault();
 });
-window.addEventListener("dragleave", () => {
+window.addEventListener("dragleave", (ev) => {
+  if (!dragHasFiles(ev)) return;
   dragDepth = Math.max(0, dragDepth - 1);
   if (dragDepth === 0) els.dropzone.hidden = true;
 });
 window.addEventListener("drop", (ev) => {
-  if (!els.dropzone.hidden) {
-    ev.preventDefault();
-    dragDepth = 0;
-    els.dropzone.hidden = true;
-    if (ev.dataTransfer && ev.dataTransfer.files) {
-      uploadFiles(ev.dataTransfer.files);
-    }
+  if (!dragHasFiles(ev)) return;
+  ev.preventDefault();
+  dragDepth = 0;
+  els.dropzone.hidden = true;
+  if (ev.dataTransfer.files && ev.dataTransfer.files.length > 0) {
+    uploadFiles(ev.dataTransfer.files);
   }
 });
 
